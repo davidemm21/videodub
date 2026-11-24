@@ -93,12 +93,22 @@ def check_environment():
                    os.path.exists(os.path.join(MODELS_DIR, EMB_MODEL_NAME)),
                    EMB_MODEL_NAME))
 
-    try:
-        requests.get("https://translate.googleapis.com", timeout=4)
-        checks.append(("Traduction Google", True, "en ligne"))
-    except Exception:
-        checks.append(("Traduction Google", False,
-                       "injoignable (pas de connexion ?)"))
+    if _azure_creds():
+        try:
+            _azure_translate(["test"], "en", "fr")
+            checks.append(("Traduction Azure", True,
+                           "en ligne — identifiants OK"))
+        except Exception as e:
+            checks.append(("Traduction Azure", False,
+                           f"en échec : {str(e)[:80]}"))
+    else:
+        try:
+            requests.get("https://translate.googleapis.com", timeout=4)
+            checks.append(("Traduction Google (repli)", True,
+                           "en ligne — Azure non configuré"))
+        except Exception:
+            checks.append(("Traduction Google (repli)", False,
+                           "injoignable (pas de connexion ?)"))
     try:
         ok = bool(asyncio.run(edge_tts.list_voices()))
     except Exception:
@@ -306,9 +316,60 @@ def _gtranslate(text, source, target):
     return "".join(chunk[0] for chunk in r.json()[0] if chunk[0])
 
 
-def translate_segments(segments, source, target):
+AZURE_ENDPOINT = "https://api.cognitive.microsofttranslator.com"
+
+
+def _azure_creds():
+    """(key, region) Azure Translator : env vars, puis dub_secrets.py
+    (gitignoré). None si non configuré."""
+    key = os.environ.get("AZURE_TRANSLATOR_KEY")
+    region = os.environ.get("AZURE_TRANSLATOR_REGION")
+    if key and region:
+        return key, region
+    try:
+        import dub_secrets
+        k = getattr(dub_secrets, "AZURE_TRANSLATOR_KEY", None)
+        r = getattr(dub_secrets, "AZURE_TRANSLATOR_REGION", None)
+        if k and r:
+            return k, r
+    except ImportError:
+        pass
+    return None
+
+
+def _azure_translate(texts, source, target):
+    """Traduit une liste de textes via Azure Translator (une requête).
+    source=None -> détection auto."""
+    creds = _azure_creds()
+    if not creds:
+        raise RuntimeError("Identifiants Azure Translator absents")
+    key, region = creds
+    params = {"api-version": "3.0", "to": target}
+    if source:
+        params["from"] = source
+    r = requests.post(f"{AZURE_ENDPOINT}/translate",
+                      params=params,
+                      headers={"Ocp-Apim-Subscription-Key": key,
+                               "Ocp-Apim-Subscription-Region": region,
+                               "Content-Type": "application/json"},
+                      json=[{"Text": t} for t in texts],
+                      timeout=30)
+    r.raise_for_status()
+    return [item["translations"][0]["text"] for item in r.json()]
+
+
+def translate_text(text, source, target):
+    """Un texte : Azure si configuré, sinon Google."""
+    if _azure_creds():
+        return _azure_translate(
+            [text], None if source == "auto" else source, target)[0]
+    return _gtranslate(text, "auto" if source == "auto" else source,
+                       target)
+
+
+def _gtranslate_segments(segments, sl, target):
+    """Traduction segment par segment via l'endpoint Google gratuit."""
     import time
-    sl = "auto" if source == "auto" else source
     for seg in segments:
         delay = 1.0
         for attempt in range(6):
@@ -322,6 +383,27 @@ def translate_segments(segments, source, target):
                 time.sleep(delay)
                 delay *= 2
         time.sleep(0.3)  # rester sous la limite de requêtes/seconde
+
+
+def translate_segments(segments, source, target):
+    """Traduit les segments : Azure en batch (~50 par requête) si les
+    identifiants sont configurés, sinon Google (appel par segment).
+    En cas d'échec d'un lot Azure, ce lot bascule sur Google."""
+    sl = "auto" if source == "auto" else source
+    if _azure_creds():
+        bsize = 50
+        for start in range(0, len(segments), bsize):
+            chunk = segments[start:start + bsize]
+            try:
+                trs = _azure_translate(
+                    [s["text"] for s in chunk],
+                    None if sl == "auto" else sl, target)
+                for s, t in zip(chunk, trs):
+                    s["translation"], s["trans_lang"] = t, target
+            except Exception:
+                _gtranslate_segments(chunk, sl, target)
+    else:
+        _gtranslate_segments(segments, sl, target)
     return segments
 
 
@@ -699,7 +781,7 @@ def preview_voice(state, speaker, voice, target_lang, max_seconds=30.0,
     buf = bytearray()
     for i, s in enumerate(chosen):
         if "translation" not in s or s.get("trans_lang") != target_lang:
-            s["translation"] = _gtranslate(s["text"], src, target_lang)
+            s["translation"] = translate_text(s["text"], src, target_lang)
             s["trans_lang"] = target_lang
         mp3 = os.path.join(tmp, f"prev_{speaker}_{i}.mp3")
         wav = os.path.join(tmp, f"prev_{speaker}_{i}.wav")

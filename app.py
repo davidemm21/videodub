@@ -423,8 +423,8 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
         <div>
           <h1>Doublage vidéo local — multi-locuteurs</h1>
           <p>Transcription Whisper (local) + diarisation (local) →
-             traduction → voix neurales Edge-TTS ou clonage Chatterbox
-             (une voix par locuteur) → nouvelle piste audio.</p>
+             traduction Azure → voix neurales Edge-TTS ou clonage
+             Chatterbox (une voix par locuteur) → nouvelle piste audio.</p>
         </div>
       </div>""")
 
