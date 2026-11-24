@@ -1,0 +1,6 @@
+mlx-whisper
+edge-tts
+requests
+gradio
+imageio-ffmpeg
+sherpa-onnx
