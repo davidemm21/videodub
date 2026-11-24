@@ -532,8 +532,11 @@ def analyze_video(video_path, diarize_speakers=True, num_speakers=0,
     trans_lang = None
     if target_lang:
         p("Traduction proposée…", 0.27)
-        translate_segments(segments, src_lang, target_lang)
-        trans_lang = target_lang
+        try:
+            translate_segments(segments, src_lang, target_lang)
+            trans_lang = target_lang
+        except Exception:
+            pass  # le rendu réessaiera ; les zones restent éditables
 
     p("Analyse terminée.", 0.3)
     return {"tmp": tmp, "src_wav": src_wav, "src_path": video_path,
