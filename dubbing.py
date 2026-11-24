@@ -371,10 +371,10 @@ def _get_chatterbox(progress=None):
         device = ("mps" if torch.backends.mps.is_available() else "cpu")
         try:
             _CHATTERBOX = ChatterboxMultilingualTTS.from_pretrained(
-                device=torch.device(device))
+                device=device)          # str attendu : "cpu"/"mps"/"cuda"
         except Exception:
             _CHATTERBOX = ChatterboxMultilingualTTS.from_pretrained(
-                device=torch.device("cpu"))
+                device="cpu")
     return _CHATTERBOX
 
 
