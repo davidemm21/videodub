@@ -4,3 +4,8 @@ requests
 gradio
 imageio-ffmpeg
 sherpa-onnx
+# option « clonage des voix » (Chatterbox)
+chatterbox-tts
+torch
+torchaudio
+soundfile

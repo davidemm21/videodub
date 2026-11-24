@@ -106,6 +106,10 @@ def check_environment():
     checks.append(("Voix neurales Edge-TTS", ok,
                    "en ligne" if ok else "injoignables"))
 
+    checks.append(("Clonage vocal Chatterbox (optionnel)", True,
+                   "installé" if chatterbox_available()
+                   else "non installé — option de clonage inactive"))
+
     return checks
 
 # Voix par défaut par langue cible (locuteur féminin/masculin réalistes)
@@ -353,6 +357,46 @@ def synthesize(text, voice, mp3_path):
     asyncio.run(_tts_one(text, voice, mp3_path))
 
 
+_CHATTERBOX = None
+
+
+def _get_chatterbox(progress=None):
+    """Chatterbox Multilingual, chargé une fois (MPS si dispo, sinon CPU)."""
+    global _CHATTERBOX
+    if _CHATTERBOX is None:
+        import torch
+        from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+        if progress:
+            progress("Chargement du modèle de clonage Chatterbox…", 0.35)
+        device = ("mps" if torch.backends.mps.is_available() else "cpu")
+        try:
+            _CHATTERBOX = ChatterboxMultilingualTTS.from_pretrained(
+                device=torch.device(device))
+        except Exception:
+            _CHATTERBOX = ChatterboxMultilingualTTS.from_pretrained(
+                device=torch.device("cpu"))
+    return _CHATTERBOX
+
+
+def chatterbox_available():
+    try:
+        import chatterbox  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def synthesize_clone(text, ref_wav, lang_id, wav_out):
+    """Synthèse par clonage : la voix de `ref_wav` prononce `text`.
+    Écrit un wav au taux natif du modèle (le calage/resample est fait
+    ensuite par fit_segment)."""
+    import soundfile as sf
+    model = _get_chatterbox()
+    audio = model.generate(text, language_id=lang_id,
+                           audio_prompt_path=ref_wav)
+    sf.write(wav_out, audio.squeeze(0).cpu().numpy(), model.sr)
+
+
 def wav_duration(path):
     with wave.open(path, "rb") as w:
         return w.getnframes() / w.getframerate()
@@ -506,9 +550,12 @@ def default_output_dir(video_path):
 
 def render_video(video_path, state, target_lang, speaker_voices,
                  original_volume=0.1, output_dir=None,
-                 edited_translations=None, progress=None):
+                 edited_translations=None, clone_voices=False,
+                 progress=None):
     """Phase 2 : traduction (corrigée par l'utilisateur si fournie)
-    + synthèse par locuteur + mixage."""
+    + synthèse par locuteur + mixage.
+    clone_voices=True : Chatterbox clone la voix de chaque locuteur depuis
+    l'audio original au lieu des voix neurales (fichier *_CHTBOX_*)."""
     def p(msg, frac):
         if progress:
             progress(msg, frac)
@@ -527,17 +574,30 @@ def render_video(video_path, state, target_lang, speaker_voices,
         p("Traduction…", 0.35)
         translate_segments(stale, state["src_lang"], target_lang)
 
+    clone_refs = {}
+    if clone_voices:
+        _get_chatterbox(progress=p)
+        for sp in state["speakers"]:
+            clone_refs[sp] = original_excerpt(state, sp)
+
     tts_wavs = []
     for i, seg in enumerate(segments):
-        voice = speaker_voices.get(seg.get("speaker", 0), default_voice)
-        mp3 = os.path.join(tmp, f"tts_{i:04d}.mp3")
+        sp = seg.get("speaker", 0)
+        raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
         wav = os.path.join(tmp, f"seg_{i:04d}.wav")
-        synthesize(seg["translation"], voice, mp3)
-        fit_segment(mp3, seg["end"] - seg["start"], wav)
+        if clone_voices:
+            synthesize_clone(seg["translation"], clone_refs[sp],
+                             target_lang, raw)
+            p(f"Clonage {i + 1}/{len(segments)} (locuteur {sp + 1})",
+              0.4 + 0.4 * (i + 1) / len(segments))
+        else:
+            voice = speaker_voices.get(sp, default_voice)
+            synthesize(seg["translation"], voice, raw)
+            p(f"Synthèse vocale {i + 1}/{len(segments)} (locuteur "
+              f"{sp + 1} → {voice})",
+              0.4 + 0.4 * (i + 1) / len(segments))
+        fit_segment(raw, seg["end"] - seg["start"], wav)
         tts_wavs.append(wav)
-        p(f"Synthèse vocale {i + 1}/{len(segments)} (locuteur "
-          f"{seg.get('speaker', 0) + 1} → {voice})",
-          0.4 + 0.4 * (i + 1) / len(segments))
 
     p("Assemblage de la piste doublée…", 0.85)
     build_dub_track(segments, tts_wavs, state["total"], dub_wav)
@@ -545,7 +605,8 @@ def render_video(video_path, state, target_lang, speaker_voices,
     p("Mixage et encodage de la vidéo finale…", 0.92)
     base = os.path.splitext(os.path.basename(video_path))[0]
     out_dir = output_dir or default_output_dir(video_path)
-    out_path = os.path.join(out_dir, f"{base}_{target_lang}.mp4")
+    tag = "CHTBOX_" if clone_voices else ""
+    out_path = os.path.join(out_dir, f"{base}_{tag}{target_lang}.mp4")
     mux(video_path, dub_wav, out_path, original_volume)
 
     p("Terminé.", 1.0)

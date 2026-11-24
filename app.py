@@ -64,11 +64,49 @@ LANGS = {
 MAX_SPEAKERS = 6
 
 CSS = """
+/* ---- look moderne, tons bleus ---- */
+body, .gradio-container {
+  font-family: "SF Pro Display", -apple-system, "Segoe UI", Inter,
+               sans-serif !important;
+}
+.vd-header {
+  display: flex; align-items: center; gap: 20px;
+  padding: 20px 26px; margin-bottom: 14px;
+  border-radius: 18px;
+  background: linear-gradient(120deg, #0a2a6b 0%, #1155c9 55%,
+                               #1e88e5 100%);
+  box-shadow: 0 8px 24px rgba(17, 85, 201, .25);
+}
+.vd-header img {
+  height: 72px; object-fit: contain;
+  background: #ffffff; padding: 8px 14px; border-radius: 12px;
+}
+.vd-header h1 { margin: 0; color: #fff; font-size: 1.55rem;
+                font-weight: 700; letter-spacing: .2px; }
+.vd-header p  { margin: 4px 0 0; color: #dbe9ff; font-size: .92rem; }
+.gradio-container .prose h3 { color: #1155c9; }
+/* ---- statuts analyse ---- */
 @keyframes vd-blink { 50% { opacity: 0.25; } }
 .vd-blink { animation: vd-blink 1s ease-in-out infinite;
             color: #d97706; font-weight: 600; }
 .vd-ready { color: #16a34a; font-weight: 600; }
 """
+
+LOGO_B64 = None
+
+
+def _logo_b64():
+    global LOGO_B64
+    if LOGO_B64 is None:
+        import base64
+        p = os.path.join(GIT_DIR, "assets", "logo_ap.png")
+        with open(p, "rb") as f:
+            LOGO_B64 = base64.b64encode(f.read()).decode()
+    return LOGO_B64
+
+
+THEME = gr.themes.Ocean(primary_hue="blue", secondary_hue="sky",
+                        neutral_hue="slate")
 MSG_WAIT = "En attente d'une vidéo et d'une langue cible…"
 MSG_READY = "✅ Vidéo prête à être analysée"
 MSG_BUSY = "⏳ Vidéo en cours d'analyse…"
@@ -253,12 +291,15 @@ def _collect_edits(speakers, trad_vals):
             and trad_vals[i] and trad_vals[i].strip()}
 
 
-def render(video, lang_name, keep, local_path, state, *vals,
+def render(video, lang_name, keep, local_path, state, clone, *vals,
            progress=gr.Progress()):
     if not lang_name:
         raise gr.Error("Choisis d'abord la langue cible.")
     if not state:
         raise gr.Error("Lance d'abord l'analyse (étape 1).")
+    if clone and not dubbing.chatterbox_available():
+        raise gr.Error("Chatterbox n'est pas installé "
+                       "(pip install chatterbox-tts).")
     src = _resolve_source(video, local_path)
     lang = LANGS[lang_name]
     speakers = state["speakers"]
@@ -280,6 +321,7 @@ def render(video, lang_name, keep, local_path, state, *vals,
         return dubbing.render_video(src, state, lang, speaker_voices,
                                     original_volume=keep, output_dir=out_dir,
                                     edited_translations=edited,
+                                    clone_voices=clone,
                                     progress=lambda m, f:
                                     report(m, 0.33 + 0.67 * f))
 
@@ -290,11 +332,18 @@ def render(video, lang_name, keep, local_path, state, *vals,
             yield payload, f"✅ Sauvée dans : {payload}"
 
 
-with gr.Blocks(title="Video Dubber", css=CSS) as demo:
-    gr.Markdown("# Doublage vidéo local — multi-locuteurs\n"
-                "Transcription Whisper (local) + diarisation (local) → "
-                "traduction Google → voix neurales Edge-TTS (une par "
-                "locuteur) → nouvelle piste audio.")
+with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
+    gr.HTML(f"""
+      <div class="vd-header">
+        <img src="data:image/png;base64,{_logo_b64()}"
+             alt="Aviation et Pilote">
+        <div>
+          <h1>Doublage vidéo local — multi-locuteurs</h1>
+          <p>Transcription Whisper (local) + diarisation (local) →
+             traduction → voix neurales Edge-TTS ou clonage Chatterbox
+             (une voix par locuteur) → nouvelle piste audio.</p>
+        </div>
+      </div>""")
 
     health = gr.Markdown("⏳ Vérification de l'environnement…")
 
@@ -320,6 +369,13 @@ with gr.Blocks(title="Video Dubber", css=CSS) as demo:
                      "ex. : 2 pour un dialogue à deux")
             keep = gr.Slider(0, 0.5, value=0.1, step=0.05,
                              label="Voix originales en fond (0 = supprimées)")
+            clone = gr.Checkbox(
+                value=False,
+                label="Cloner les voix originales (Chatterbox)",
+                info="Chaque locuteur est doublé par un clone de sa propre "
+                     "voix — bien plus fidèle mais plus lent. Les menus "
+                     "de voix neurales sont ignorés. "
+                     "Fichier : nom_CHTBOX_langue.mp4")
             status_msg = gr.Markdown(MSG_WAIT)
             btn_an = gr.Button("Analyser la vidéo", variant="primary",
                                interactive=False)
@@ -458,10 +514,16 @@ with gr.Blocks(title="Video Dubber", css=CSS) as demo:
                      previews)
     for i, btn_o in enumerate(orig_btns):
         btn_o.click(partial(play_original, i), [state], previews[i])
-    btn_go.click(render, [in_video, lang, keep, local_path, state]
+    clone.change(
+        lambda c: [gr.update(interactive=not c)] * MAX_SPEAKERS,
+        clone, voice_dds)
+    btn_go.click(render, [in_video, lang, keep, local_path, state, clone]
                  + voice_dds + trad_txts, [out_video, info])
 
 if __name__ == "__main__":
     # Synchro GitHub : pousse chaque modification après 30 s de stabilité
     threading.Thread(target=git_sync_watcher, daemon=True).start()
-    demo.launch(inbrowser=True, max_file_size="20gb")
+    demo.launch(inbrowser=True, max_file_size="20gb",
+                allowed_paths=[GIT_DIR,
+                               os.path.expanduser("~/Downloads"),
+                               "/Volumes"])
