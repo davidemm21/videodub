@@ -2,12 +2,59 @@
 Lancement : .venv/bin/python app.py  ->  http://127.0.0.1:7860"""
 
 import os
+import subprocess
 import threading
+import time
 from functools import partial
 
 import gradio as gr
 
 import dubbing
+
+GIT_DIR = os.path.dirname(os.path.abspath(__file__))
+GIT_REMOTE = "origin"
+GIT_BRANCH = "main"
+
+
+def _git(*args):
+    return subprocess.run(["git", "-C", GIT_DIR, *args],
+                          capture_output=True, text=True)
+
+
+def _dirty_mtime():
+    """mtime le plus récent parmi les fichiers modifiés/non suivis."""
+    r = _git("status", "--porcelain")
+    mtimes = []
+    for line in r.stdout.splitlines():
+        f = line[3:].strip().strip('"')
+        p = os.path.join(GIT_DIR, f)
+        if os.path.isfile(p):
+            mtimes.append(os.path.getmtime(p))
+    return max(mtimes) if mtimes else None
+
+
+def _sync_once():
+    """Commit + push si des changements sont en attente."""
+    _git("add", "-A")
+    msg = "sync: " + time.strftime("%Y-%m-%d %H:%M")
+    r = _git("commit", "-m", msg)
+    if r.returncode != 0:
+        return
+    push = _git("push", GIT_REMOTE, GIT_BRANCH)
+    status = "ok" if push.returncode == 0 else push.stderr[-200:]
+    print(f"[gitsync] {msg} -> {status}", flush=True)
+
+
+def git_sync_watcher(poll=15, quiet_window=30):
+    """Pousse sur GitHub dès que le dépôt est stable depuis `quiet_window` s."""
+    while True:
+        time.sleep(poll)
+        try:
+            mtime = _dirty_mtime()
+        except Exception:
+            continue
+        if mtime and time.time() - mtime >= quiet_window:
+            _sync_once()
 
 LANGS = {
     "Français": "fr", "Anglais": "en", "Espagnol": "es", "Allemand": "de",
@@ -298,4 +345,6 @@ with gr.Blocks(title="Video Dubber") as demo:
                  + voice_dds, [out_video, info])
 
 if __name__ == "__main__":
+    # Synchro GitHub : pousse chaque modification après 30 s de stabilité
+    threading.Thread(target=git_sync_watcher, daemon=True).start()
     demo.launch(inbrowser=True, max_file_size="20gb")

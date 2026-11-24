@@ -1,15 +1,19 @@
 #!/bin/bash
-# Synchronisation automatique video-dubber -> GitHub (davidemm21/videodub)
-# Appelée par launchd toutes les 15 min ; ne fait rien s'il n'y a pas de changement.
-cd "/Volumes/Mustang/DEV/video-dubber" || exit 1
+# Synchronisation video-dubber -> GitHub (davidemm21/videodub)
+# Déclenchée par launchd à chaque modification (WatchPaths).
 LOG=/tmp/videodub_sync.log
+echo "--- $(date) sync.sh start ---" >>"$LOG"
 
-git add -A
-if git diff --cached --quiet; then
-    exit 0   # rien à synchroniser
+# Petite fenêtre de stabilisation : regroupe les sauvegardes rapides
+sleep 15
+
+cd "/Volumes/Mustang/DEV/video-dubber" 2>>"$LOG" || exit 1
+
+git add -A 2>>"$LOG"
+if git diff --cached --quiet 2>>"$LOG"; then
+    echo "rien à synchroniser" >>"$LOG"
+    exit 0
 fi
-{
-    echo "=== $(date) ==="
-    git commit -m "sync: $(date '+%Y-%m-%d %H:%M')"
-    git push origin main
-} >>"$LOG" 2>&1
+git commit -m "sync: $(date '+%Y-%m-%d %H:%M')" >>"$LOG" 2>&1
+git push origin main >>"$LOG" 2>&1
+echo "push exit: $?" >>"$LOG"
