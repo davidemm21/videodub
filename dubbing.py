@@ -166,12 +166,23 @@ def transcribe(wav_path, progress=None):
         audio = (np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
                  .astype(np.float32) / 32768.0)
     result = mlx_whisper.transcribe(
-        audio, path_or_hf_repo=whisper_model_path(progress))
-    segments = [
-        {"start": s["start"], "end": s["end"], "text": s["text"].strip()}
-        for s in result["segments"]
-        if s["text"].strip()
-    ]
+        audio, path_or_hf_repo=whisper_model_path(progress),
+        word_timestamps=True)
+    dur = len(audio) / SAMPLE_RATE
+    segments = []
+    for s in result["segments"]:
+        text = s["text"].strip()
+        if not text:
+            continue
+        start, end = s["start"], s["end"]
+        words = s.get("words") or []
+        if words:        # frontières précises : 1er et dernier mot
+            start, end = words[0]["start"], words[-1]["end"]
+        # borne à la durée réelle (Whisper hallucine parfois la fin)
+        start, end = max(0.0, start), min(end, dur)
+        if end - start < 0.05:
+            continue
+        segments.append({"start": start, "end": end, "text": text})
     return segments, result.get("language", "auto")
 
 
@@ -573,8 +584,11 @@ def fit_segment(mp3_path, slot_seconds, wav_out):
     filters = []
     if factor > 1.12:                      # trop long -> accélérer
         filters.append(_atempo_chain(min(factor, 4.0)))
-    elif factor < 0.8:                     # beaucoup trop court -> ralentir un peu
-        filters.append(_atempo_chain(max(dur / (slot_seconds * 0.9), 0.6)))
+    elif factor < 0.95 and slot_seconds - dur <= 1.5:
+        # léger décalage : étirer doucement (min x0.85). Au-delà on
+        # préfère la voix naturelle + silence en fin de créneau.
+        filters.append(_atempo_chain(
+            max(dur / (slot_seconds * 0.95), 0.85)))
     run([FFMPEG, "-y", "-i", mp3_path, "-ac", "1", "-ar", str(SAMPLE_RATE)]
         + (["-af", ",".join(filters)] if filters else [])
         + ["-c:a", "pcm_s16le", wav_out])
@@ -607,18 +621,56 @@ def build_dub_track(segments, tts_wavs, total_seconds, out_wav):
         w.writeframes(bytes(buf))
 
 
-def mux(video, dub_wav, out_path, original_volume=0.1):
-    if original_volume <= 0:
-        run([FFMPEG, "-y", "-i", video, "-i", dub_wav,
-             "-map", "0:v", "-map", "1:a",
-             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out_path])
-    else:
-        run([FFMPEG, "-y", "-i", video, "-i", dub_wav,
-             "-filter_complex",
-             f"[0:a]volume={original_volume}[bg];"
-             f"[bg][1:a]amix=inputs=2:duration=first:normalize=0[aout]",
-             "-map", "0:v", "-map", "[aout]",
-             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out_path])
+def mix_duck(src_wav, segments, tts_wavs, dub_wav, out_wav,
+             original_volume):
+    """Piste finale : voix doublées + audio original atténué
+    (`original_volume`) uniquement sous les segments de parole, avec
+    rampes de 120 ms — le reste (jingle, musique, ambiance) reste à
+    100 %. original_volume=0 -> original uniquement hors parole."""
+    import numpy as np
+
+    def read(path):
+        with wave.open(path, "rb") as w:
+            return (np.frombuffer(w.readframes(w.getnframes()),
+                                  dtype=np.int16)
+                    .astype(np.float32) / 32768.0)
+
+    orig, dub = read(src_wav), read(dub_wav)
+    n = max(len(orig), len(dub))
+    orig = np.pad(orig, (0, n - len(orig)))
+    dub = np.pad(dub, (0, n - len(dub)))
+
+    env = np.ones(n, dtype=np.float32)
+    ramp = int(0.12 * SAMPLE_RATE)
+    for i, seg in enumerate(segments):
+        if tts_wavs[i] is None:
+            continue
+        s = int(seg["start"] * SAMPLE_RATE)
+        e = int(seg["end"] * SAMPLE_RATE)
+        a0, r1 = max(0, s - ramp), min(n, e + ramp)
+        if a0 < s:
+            env[a0:s] = np.minimum(
+                env[a0:s],
+                np.linspace(1.0, original_volume, s - a0))
+        env[s:e] = original_volume
+        if r1 > e:
+            env[e:r1] = np.minimum(
+                env[e:r1],
+                np.linspace(original_volume, 1.0, r1 - e))
+
+    mix = np.clip(orig * env + dub, -1.0, 1.0)
+    with wave.open(out_wav, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes((mix * 32767).astype(np.int16).tobytes())
+
+
+def mux(video, audio_wav, out_path, original_volume=0.1):
+    """Mux simple : vidéo + piste audio déjà mixée."""
+    run([FFMPEG, "-y", "-i", video, "-i", audio_wav,
+         "-map", "0:v", "-map", "1:a",
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", out_path])
 
 
 def list_voices(lang_prefix):
@@ -789,11 +841,14 @@ def render_video(video_path, state, target_lang, speaker_voices,
     build_dub_track(segments, tts_wavs, state["total"], dub_wav)
 
     p("Mixage et encodage de la vidéo finale…", 0.92)
+    mix_wav = os.path.join(tmp, "mix.wav")
+    mix_duck(state["src_wav"], segments, tts_wavs, dub_wav, mix_wav,
+             original_volume)
     base = os.path.splitext(os.path.basename(video_path))[0]
     out_dir = output_dir or default_output_dir(video_path)
     tag = "CHTBOX_" if clone_voices else ""
     out_path = os.path.join(out_dir, f"{base}_{tag}{target_lang}.mp4")
-    mux(video_path, dub_wav, out_path, original_volume)
+    mux(video_path, mix_wav, out_path, original_volume)
 
     p("Terminé.", 1.0)
     return out_path

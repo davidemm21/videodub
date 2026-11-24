@@ -451,7 +451,9 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                 info="Force le découpage si l'auto-détection en rate — "
                      "ex. : 2 pour un dialogue à deux")
             keep = gr.Slider(0, 0.5, value=0.1, step=0.05,
-                             label="Voix originales en fond (0 = supprimées)")
+                             label="Original sous les voix (0 = muet)",
+                             info="Hors parole, l'audio original reste à "
+                                  "100 % — jingle et musique conservés.")
             clone = gr.Checkbox(
                 value=False,
                 label="Cloner les voix originales (Chatterbox)",
