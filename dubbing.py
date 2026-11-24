@@ -450,6 +450,51 @@ def synthesize(text, voice, mp3_path):
             delay *= 2
 
 
+def synthesize_batch(items, progress=None):
+    """Synthétise [(text, voice, path), ...] en parallèle (8 max),
+    retries par segment. progress(done_count) appelé à chaque fin."""
+    done = [0]
+
+    async def _run():
+        sem = asyncio.Semaphore(8)
+
+        async def one(t, v, p):
+            async with sem:
+                last = None
+                for attempt in range(3):
+                    try:
+                        await edge_tts.Communicate(t, v).save(p)
+                        break
+                    except Exception as e:
+                        last = e
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                else:
+                    raise last
+            done[0] += 1
+            if progress:
+                progress(done[0])
+
+        await asyncio.gather(*[one(*it) for it in items])
+
+    asyncio.run(_run())
+
+
+def fit_segments_parallel(jobs, progress=None, workers=4):
+    """jobs : [(raw_path, slot_seconds, wav_out)] — calage ffmpeg
+    en parallèle. progress(done_count) à chaque fin."""
+    from concurrent.futures import ThreadPoolExecutor
+    done = [0]
+
+    def _fit(job):
+        fit_segment(*job)
+        done[0] += 1
+        if progress:
+            progress(done[0])
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_fit, jobs))
+
+
 _CHATTERBOX = None
 
 
@@ -700,27 +745,45 @@ def render_video(video_path, state, target_lang, speaker_voices,
         for sp in state["speakers"]:
             clone_refs[sp] = original_excerpt(state, sp)
 
-    tts_wavs = []
-    for i, seg in enumerate(segments):
-        sp = seg.get("speaker", 0)
-        raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
-        wav = os.path.join(tmp, f"seg_{i:04d}.wav")
-        text = (seg.get("translation") or "").strip()
-        if not text:
-            tts_wavs.append(None)            # rien à dire -> silence
-            continue
-        if clone_voices:
+    tts_wavs = [None] * len(segments)
+    if clone_voices:
+        # Clonage : séquentiel (le modèle MPS ne parallélise pas)
+        for i, seg in enumerate(segments):
+            text = (seg.get("translation") or "").strip()
+            if not text:
+                continue
+            sp = seg.get("speaker", 0)
+            raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
+            wav = os.path.join(tmp, f"seg_{i:04d}.wav")
             synthesize_clone(text, clone_refs[sp], target_lang, raw)
+            fit_segment(raw, seg["end"] - seg["start"], wav)
+            tts_wavs[i] = wav
             p(f"Clonage {i + 1}/{len(segments)} (locuteur {sp + 1})",
               0.4 + 0.4 * (i + 1) / len(segments))
-        else:
+    else:
+        # Voix neurales : TTS en parallèle puis calage en parallèle
+        jobs, fit_jobs = [], []
+        for i, seg in enumerate(segments):
+            text = (seg.get("translation") or "").strip()
+            if not text:
+                continue
+            sp = seg.get("speaker", 0)
             voice = speaker_voices.get(sp, default_voice)
-            synthesize(text, voice, raw)
-            p(f"Synthèse vocale {i + 1}/{len(segments)} (locuteur "
-              f"{sp + 1} → {voice})",
-              0.4 + 0.4 * (i + 1) / len(segments))
-        fit_segment(raw, seg["end"] - seg["start"], wav)
-        tts_wavs.append(wav)
+            raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
+            jobs.append((text, voice, raw))
+            fit_jobs.append((i, raw, seg["end"] - seg["start"],
+                             os.path.join(tmp, f"seg_{i:04d}.wav")))
+        n = max(len(jobs), 1)
+        synthesize_batch(
+            jobs,
+            progress=lambda d: p(f"Synthèse vocale {d}/{len(jobs)}",
+                                 0.4 + 0.3 * d / n))
+        fit_segments_parallel(
+            [(r, slot, w) for _, r, slot, w in fit_jobs],
+            progress=lambda d: p(f"Calage temporel {d}/{len(fit_jobs)}",
+                                 0.7 + 0.1 * d / n))
+        for i, raw, slot, wav in fit_jobs:
+            tts_wavs[i] = wav
 
     p("Assemblage de la piste doublée…", 0.85)
     build_dub_track(segments, tts_wavs, state["total"], dub_wav)
@@ -778,14 +841,19 @@ def preview_voice(state, speaker, voice, target_lang, max_seconds=30.0,
             break
 
     src = state["src_lang"] if state["src_lang"] != "auto" else "auto"
+    need = [s for s in chosen
+            if "translation" not in s or s.get("trans_lang") != target_lang]
+    if need:
+        translate_segments(need, src, target_lang)
+
+    # TTS en parallèle puis conversion wav
+    tts_jobs = [(s["translation"], voice,
+                 os.path.join(tmp, f"prev_{speaker}_{i}.mp3"))
+                for i, s in enumerate(chosen)]
+    synthesize_batch(tts_jobs)
     buf = bytearray()
-    for i, s in enumerate(chosen):
-        if "translation" not in s or s.get("trans_lang") != target_lang:
-            s["translation"] = translate_text(s["text"], src, target_lang)
-            s["trans_lang"] = target_lang
-        mp3 = os.path.join(tmp, f"prev_{speaker}_{i}.mp3")
+    for i, (t, v, mp3) in enumerate(tts_jobs):
         wav = os.path.join(tmp, f"prev_{speaker}_{i}.wav")
-        synthesize(s["translation"], voice, mp3)
         run([FFMPEG, "-y", "-i", mp3, "-ac", "1", "-ar", str(SAMPLE_RATE),
              "-c:a", "pcm_s16le", wav])
         buf += read_wav_frames(wav)
