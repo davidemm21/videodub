@@ -90,6 +90,14 @@ body, .gradio-container {
 .vd-blink { animation: vd-blink 1s ease-in-out infinite;
             color: #d97706; font-weight: 600; }
 .vd-ready { color: #16a34a; font-weight: 600; }
+/* ---- pied de page ---- */
+body { padding-bottom: 46px; }
+.vd-footer {
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 50;
+  text-align: center; padding: 9px 12px;
+  background: linear-gradient(90deg, #0a2a6b, #1155c9, #0a2a6b);
+  color: #cfe1ff; font-size: .8rem; letter-spacing: .4px;
+}
 """
 
 LOGO_B64 = None
@@ -157,11 +165,12 @@ def gate(video, lang_name, local_path, *voice_vals):
 
 def _run_with_status(work, progress):
     """Exécute work(report) dans un thread en relayant son statut.
-    Générateur : yield ("status", msg) pendant, puis ("result", value)."""
-    status, result, error = {"msg": "Démarrage…"}, {}, {}
+    Générateur : yield ("status", msg, frac) pendant,
+    puis ("result", value, 1.0)."""
+    status, result, error = {"msg": "Démarrage…", "frac": 0.0}, {}, {}
 
     def report(msg, frac):
-        status["msg"] = msg
+        status["msg"], status["frac"] = msg, frac
         progress(frac, desc=msg)
 
     def runner():
@@ -175,12 +184,19 @@ def _run_with_status(work, progress):
     last = None
     while t.is_alive():
         t.join(0.25)
-        if status["msg"] != last:
-            last = status["msg"]
-            yield ("status", last)
+        cur = (status["msg"], status["frac"])
+        if cur != last:
+            last = cur
+            yield ("status", status["msg"], status["frac"])
     if error:
         raise error["e"]
-    yield ("result", result["value"])
+    yield ("result", result["value"], 1.0)
+
+
+def _prog_bar(frac, width=18):
+    """Barre de progression ASCII : ██████░░░░."""
+    filled = int(round(frac * width))
+    return "█" * filled + "░" * (width - filled)
 
 
 def _file_info(video):
@@ -224,73 +240,83 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                                      progress=lambda m, f:
                                      report(m, min(f, 0.33)))
 
-    for kind, payload in _run_with_status(work, progress):
-        if kind == "status":
-            yield [_file_info(src) + f"\n\n⏳ {payload}", None] + hidden
-            continue
+    try:
+        for kind, payload, frac in _run_with_status(work, progress):
+            if kind == "status":
+                yield ([_file_info(src) + f"\n\n⏳ {_prog_bar(frac)} "
+                        f"{int(frac * 100):3d} % — {payload}", None]
+                       + hidden)
+                continue
 
-        state = payload
-        speakers, segments = state["speakers"], state["segments"]
-        n = len(speakers)
-        if n > 1:
-            voices = dubbing.auto_assign_voices(speakers, lang,
-                                                state.get("genders"))
-        else:
-            voices = {speakers[0]: dubbing.DEFAULT_VOICES.get(
-                lang, "en-US-AriaNeural")}
-
-        choices = dubbing.list_voices(lang)
-        speaker_segs = {sp: [s for s in segments if s.get("speaker") == sp]
-                        for sp in speakers}
-        lines = [_file_info(src), "",
-                 f"**Langue détectée : {state['src_lang']}** — "
-                 f"{len(segments)} segments, "
-                 f"**{n} locuteur{'s' if n > 1 else ''}** détecté"
-                 f"{'s' if n > 1 else ''}."]
-        updates = []
-        restored = 0
-        for i in range(MAX_SPEAKERS):
-            if i < n:
-                sp = speakers[i]
-                segs = speaker_segs[sp]
-                t = sum(s["end"] - s["start"] for s in segs)
-                sample = segs[0]["text"][:80]
-                g = state.get("genders", {}).get(sp)
-                gtxt = {"Male": "voix grave (H)",
-                        "Female": "voix aiguë (F)",
-                        "Unknown": "genre ?"}.get(g, "")
-                proposed = "\n\n".join(s.get("translation", "")
-                                       for s in segs)
-                trad, was_restored = _trad_value_or_saved(
-                    src, i, lang, proposed)
-                restored += was_restored
-                updates += [
-                    gr.update(visible=True),   # le bloc complet
-                    gr.update(visible=True, choices=choices, value=voices[sp],
-                              label=f"Locuteur {i + 1}"
-                                    f"{f' — {gtxt}' if gtxt else ''} — "
-                                    f"{len(segs)} segments, {t:.0f}s — "
-                                    f"« {sample} »"),
-                    gr.update(value="\n\n".join(s["text"] for s in segs)),
-                    gr.update(value=trad),
-                ]
+            state = payload
+            speakers, segments = state["speakers"], state["segments"]
+            n = len(speakers)
+            if n > 1:
+                voices = dubbing.auto_assign_voices(
+                    speakers, lang, state.get("genders"))
             else:
-                updates += [gr.update(visible=False), gr.update(),
-                            gr.update(), gr.update()]
-        lines.append("✏️ **Corrige les traductions** dans les zones de "
-                     "droite — sauvegarde automatique à chaque frappe "
-                     "(`*_traduction_NN_langue.txt` à côté de la vidéo) "
-                     "puis clique « Générer la vidéo doublée ».")
-        if restored:
-            lines.append(f"💾 {restored} traduction(s) restaurée(s) "
-                         f"depuis les fichiers de sauvegarde.")
-        if n > MAX_SPEAKERS:
-            lines.append(f"⚠️ {n - MAX_SPEAKERS} locuteurs supplémentaires "
-                         f"utiliseront la voix du locuteur {MAX_SPEAKERS}.")
-        yield (["\n".join(lines), state] + updates
-               + [gr.update(visible=True)]                     # accordéon
-               + [gr.update(visible=False)] * MAX_SPEAKERS      # audios
-               + [gr.update(visible=False)])                   # statut
+                voices = {speakers[0]: dubbing.DEFAULT_VOICES.get(
+                    lang, "en-US-AriaNeural")}
+
+            choices = dubbing.list_voices(lang)
+            speaker_segs = {sp: [s for s in segments
+                                 if s.get("speaker") == sp]
+                            for sp in speakers}
+            lines = [_file_info(src), "",
+                     f"**Langue détectée : {state['src_lang']}** — "
+                     f"{len(segments)} segments, "
+                     f"**{n} locuteur{'s' if n > 1 else ''}** détecté"
+                     f"{'s' if n > 1 else ''}."]
+            updates = []
+            restored = 0
+            for i in range(MAX_SPEAKERS):
+                if i < n:
+                    sp = speakers[i]
+                    segs = speaker_segs[sp]
+                    t = sum(s["end"] - s["start"] for s in segs)
+                    sample = segs[0]["text"][:80]
+                    g = state.get("genders", {}).get(sp)
+                    gtxt = {"Male": "voix grave (H)",
+                            "Female": "voix aiguë (F)",
+                            "Unknown": "genre ?"}.get(g, "")
+                    proposed = "\n\n".join(s.get("translation", "")
+                                           for s in segs)
+                    trad, was_restored = _trad_value_or_saved(
+                        src, i, lang, proposed)
+                    restored += was_restored
+                    updates += [
+                        gr.update(visible=True),  # le bloc complet
+                        gr.update(visible=True, choices=choices,
+                                  value=voices[sp],
+                                  label=f"Locuteur {i + 1}"
+                                        f"{f' — {gtxt}' if gtxt else ''}"
+                                        f" — {len(segs)} segments, "
+                                        f"{t:.0f}s — « {sample} »"),
+                        gr.update(value="\n\n".join(s["text"]
+                                                   for s in segs)),
+                        gr.update(value=trad),
+                    ]
+                else:
+                    updates += [gr.update(visible=False), gr.update(),
+                                gr.update(), gr.update()]
+            lines.append("✏️ **Corrige les traductions** dans les zones de "
+                         "droite — sauvegarde automatique à chaque frappe "
+                         "(`*_traduction_NN_langue.txt` à côté de la vidéo) "
+                         "puis clique « Générer la vidéo doublée ».")
+            if restored:
+                lines.append(f"💾 {restored} traduction(s) restaurée(s) "
+                             f"depuis les fichiers de sauvegarde.")
+            if n > MAX_SPEAKERS:
+                lines.append(f"⚠️ {n - MAX_SPEAKERS} locuteurs "
+                             f"supplémentaires utiliseront la voix du "
+                             f"locuteur {MAX_SPEAKERS}.")
+            yield (["\n".join(lines), state] + updates
+                   + [gr.update(visible=True)]                # accordéon
+                   + [gr.update(visible=False)] * MAX_SPEAKERS  # audios
+                   + [gr.update(visible=False)])               # statut
+    except Exception as e:
+        yield ([f"❌ Erreur pendant l'analyse : {e}", None] + hidden)
+        return
 
 
 def _collect_edits(speakers, trad_vals):
@@ -369,11 +395,15 @@ def render(video, lang_name, keep, local_path, state, clone, *vals,
                                     progress=lambda m, f:
                                     report(m, 0.33 + 0.67 * f))
 
-    for kind, payload in _run_with_status(work, progress):
-        if kind == "status":
-            yield None, f"⏳ {payload}"
-        else:
-            yield payload, f"✅ Sauvée dans : {payload}"
+    try:
+        for kind, payload, frac in _run_with_status(work, progress):
+            if kind == "status":
+                yield None, (f"⏳ {_prog_bar(frac)} "
+                             f"{int(frac * 100):3d} % — {payload}")
+            else:
+                yield payload, f"✅ Vidéo sauvée dans : {payload}"
+    except Exception as e:
+        yield None, f"❌ Erreur pendant la génération : {e}"
 
 
 with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
@@ -572,6 +602,9 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
         clone, voice_dds)
     btn_go.click(render, [in_video, lang, keep, local_path, state, clone]
                  + voice_dds + trad_txts, [out_video, info])
+
+    gr.HTML('<div class="vd-footer">— Copyright Emmanuel S. Davidson — '
+            'Licensed to Aviation et Pilote 2026 —</div>')
 
 if __name__ == "__main__":
     # Synchro GitHub : pousse chaque modification après 30 s de stabilité

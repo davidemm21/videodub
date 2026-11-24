@@ -354,7 +354,18 @@ async def _tts_one(text, voice, mp3_path):
 
 
 def synthesize(text, voice, mp3_path):
-    asyncio.run(_tts_one(text, voice, mp3_path))
+    """Synthèse edge-tts avec retries (réseau instable / rate-limit)."""
+    import time
+    delay = 1.0
+    for attempt in range(3):
+        try:
+            asyncio.run(_tts_one(text, voice, mp3_path))
+            return
+        except Exception:
+            if attempt == 2:
+                raise
+            time.sleep(delay)
+            delay *= 2
 
 
 _CHATTERBOX = None
@@ -453,6 +464,8 @@ def build_dub_track(segments, tts_wavs, total_seconds, out_wav):
     n = int(total_seconds * SAMPLE_RATE) + SAMPLE_RATE
     buf = bytearray(n * 2)
     for i, seg in enumerate(segments):
+        if tts_wavs[i] is None:               # segment sans texte -> silence
+            continue
         frames = read_wav_frames(tts_wavs[i])
         start = int(seg["start"] * SAMPLE_RATE) * 2
         next_start = (int(segments[i + 1]["start"] * SAMPLE_RATE) * 2
@@ -603,14 +616,17 @@ def render_video(video_path, state, target_lang, speaker_voices,
         sp = seg.get("speaker", 0)
         raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
         wav = os.path.join(tmp, f"seg_{i:04d}.wav")
+        text = (seg.get("translation") or "").strip()
+        if not text:
+            tts_wavs.append(None)            # rien à dire -> silence
+            continue
         if clone_voices:
-            synthesize_clone(seg["translation"], clone_refs[sp],
-                             target_lang, raw)
+            synthesize_clone(text, clone_refs[sp], target_lang, raw)
             p(f"Clonage {i + 1}/{len(segments)} (locuteur {sp + 1})",
               0.4 + 0.4 * (i + 1) / len(segments))
         else:
             voice = speaker_voices.get(sp, default_voice)
-            synthesize(seg["translation"], voice, raw)
+            synthesize(text, voice, raw)
             p(f"Synthèse vocale {i + 1}/{len(segments)} (locuteur "
               f"{sp + 1} → {voice})",
               0.4 + 0.4 * (i + 1) / len(segments))

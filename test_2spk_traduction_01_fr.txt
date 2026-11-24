@@ -1,0 +1,3 @@
+Et je suis le deuxième orateur, une voix différente.
+
+Super, voyons si l'application détecte deux personnes.
