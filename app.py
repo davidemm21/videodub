@@ -248,6 +248,7 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                  f"**{n} locuteur{'s' if n > 1 else ''}** détecté"
                  f"{'s' if n > 1 else ''}."]
         updates = []
+        restored = 0
         for i in range(MAX_SPEAKERS):
             if i < n:
                 sp = speakers[i]
@@ -258,6 +259,11 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                 gtxt = {"Male": "voix grave (H)",
                         "Female": "voix aiguë (F)",
                         "Unknown": "genre ?"}.get(g, "")
+                proposed = "\n\n".join(s.get("translation", "")
+                                       for s in segs)
+                trad, was_restored = _trad_value_or_saved(
+                    src, i, lang, proposed)
+                restored += was_restored
                 updates += [
                     gr.update(visible=True),   # le bloc complet
                     gr.update(visible=True, choices=choices, value=voices[sp],
@@ -265,16 +271,19 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                                     f"{f' — {gtxt}' if gtxt else ''} — "
                                     f"{len(segs)} segments, {t:.0f}s — "
                                     f"« {sample} »"),
-                    gr.update(value="\n".join(s["text"] for s in segs)),
-                    gr.update(value="\n".join(s.get("translation", "")
-                                             for s in segs)),
+                    gr.update(value="\n\n".join(s["text"] for s in segs)),
+                    gr.update(value=trad),
                 ]
             else:
                 updates += [gr.update(visible=False), gr.update(),
                             gr.update(), gr.update()]
         lines.append("✏️ **Corrige les traductions** dans les zones de "
-                     "droite (1 ligne = 1 segment) puis clique "
-                     "« Générer la vidéo doublée ».")
+                     "droite — sauvegarde automatique à chaque frappe "
+                     "(`*_traduction_NN_langue.txt` à côté de la vidéo) "
+                     "puis clique « Générer la vidéo doublée ».")
+        if restored:
+            lines.append(f"💾 {restored} traduction(s) restaurée(s) "
+                         f"depuis les fichiers de sauvegarde.")
         if n > MAX_SPEAKERS:
             lines.append(f"⚠️ {n - MAX_SPEAKERS} locuteurs supplémentaires "
                          f"utiliseront la voix du locuteur {MAX_SPEAKERS}.")
@@ -289,6 +298,41 @@ def _collect_edits(speakers, trad_vals):
     return {sp: trad_vals[i] for i, sp in enumerate(speakers)
             if i < MAX_SPEAKERS
             and trad_vals[i] and trad_vals[i].strip()}
+
+
+def _trad_value_or_saved(src, i, lang_code, proposed):
+    """Valeur affichée : fichier de sauvegarde existant (édition
+    précédente) ou la proposition, qui est alors persistée."""
+    path = dubbing.translation_file(src, i, lang_code)
+    if os.path.exists(path):
+        try:
+            saved = open(path, encoding="utf-8").read()
+            if saved.strip():
+                return saved, True
+        except OSError:
+            pass
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(proposed)
+    except OSError:
+        pass
+    return proposed, False
+
+
+def save_trad(i, video, local_path, lang_name, text):
+    """Persiste le texte de traduction du locuteur i à chaque
+    modification (sécurité contre perte au rafraîchissement)."""
+    if not lang_name:
+        return
+    src = (local_path or "").strip() or video
+    if not src or not os.path.exists(src):
+        return
+    try:
+        with open(dubbing.translation_file(src, i, LANGS[lang_name]),
+                  "w", encoding="utf-8") as f:
+            f.write(text or "")
+    except OSError:
+        pass
 
 
 def render(video, lang_name, keep, local_path, state, clone, *vals,
@@ -398,10 +442,11 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                             interactive=False, lines=6, max_lines=12)
                         t_trad = gr.Textbox(
                             label=f"Traduction — locuteur {i + 1} "
-                                  f"(éditable · 1 ligne = 1 segment)",
+                                  f"(éditable · 1 paragraphe = 1 segment)",
                             interactive=True, lines=6, max_lines=12,
-                            info="Corrige librement ; la vidéo utilisera "
-                                 "ce texte pour la voix.")
+                            info="Corrige librement ; sauvegardé "
+                                 "automatiquement à côté de la vidéo. "
+                                 "Les lignes vides sont ignorées.")
                 speaker_rows.append(col)
                 voice_dds.append(dd)
                 orig_btns.append(btn_o)
@@ -473,9 +518,14 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                 sp = state["speakers"][i]
                 segs = [s for s in state["segments"]
                         if s.get("speaker") == sp]
-                outs.append(gr.update(
-                    value="\n".join(s.get("translation", "")
-                                    for s in segs)))
+                proposed = "\n\n".join(s.get("translation", "")
+                                       for s in segs)
+                if state.get("src_path"):
+                    val, _ = _trad_value_or_saved(
+                        state["src_path"], i, code, proposed)
+                else:
+                    val = proposed
+                outs.append(gr.update(value=val))
             else:
                 outs.append(gr.update())
         return outs
@@ -514,6 +564,9 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                      previews)
     for i, btn_o in enumerate(orig_btns):
         btn_o.click(partial(play_original, i), [state], previews[i])
+    for i, t_trad in enumerate(trad_txts):
+        t_trad.input(partial(save_trad, i),
+                     [in_video, local_path, lang, t_trad], None)
     clone.change(
         lambda c: [gr.update(interactive=not c)] * MAX_SPEAKERS,
         clone, voice_dds)

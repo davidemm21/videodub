@@ -536,8 +536,9 @@ def analyze_video(video_path, diarize_speakers=True, num_speakers=0,
         trans_lang = target_lang
 
     p("Analyse terminée.", 0.3)
-    return {"tmp": tmp, "src_wav": src_wav, "segments": segments,
-            "src_lang": src_lang, "speakers": speakers, "genders": genders,
+    return {"tmp": tmp, "src_wav": src_wav, "src_path": video_path,
+            "segments": segments, "src_lang": src_lang,
+            "speakers": speakers, "genders": genders,
             "trans_lang": trans_lang, "total": media_duration(video_path)}
 
 
@@ -551,6 +552,15 @@ def default_output_dir(video_path):
     if not is_temp and os.access(d, os.W_OK):
         return d
     return os.path.expanduser("~/Downloads")
+
+
+def translation_file(video_path, speaker_index, target_lang):
+    """Fichier de sauvegarde de la traduction éditée d'un locuteur,
+    dans le même dossier que la vidéo source (numéro séquentiel)."""
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(
+        default_output_dir(video_path),
+        f"{base}_traduction_{speaker_index + 1:02d}_{target_lang}.txt")
 
 
 def render_video(video_path, state, target_lang, speaker_voices,
