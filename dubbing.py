@@ -310,6 +310,7 @@ def translate_segments(segments, source, target):
         for attempt in range(6):
             try:
                 seg["translation"] = _gtranslate(seg["text"], sl, target)
+                seg["trans_lang"] = target
                 break
             except Exception:
                 if attempt == 5:
@@ -317,6 +318,30 @@ def translate_segments(segments, source, target):
                 time.sleep(delay)
                 delay *= 2
         time.sleep(0.3)  # rester sous la limite de requêtes/seconde
+    return segments
+
+
+def apply_edited_translations(segments, edited_by_speaker, target_lang):
+    """Applique les traductions corrigées par l'utilisateur.
+    edited_by_speaker : {speaker_id: texte multiligne} — 1 ligne = 1 segment,
+    dans l'ordre chronologique. Lignes en trop -> ajoutées au dernier
+    segment ; lignes manquantes -> la traduction proposée est conservée."""
+    segs_by_sp = {}
+    for s in segments:
+        segs_by_sp.setdefault(s.get("speaker", 0), []).append(s)
+    for sp, text in edited_by_speaker.items():
+        lines = [l.strip() for l in (text or "").split("\n") if l.strip()]
+        segs = segs_by_sp.get(sp, [])
+        if not lines or not segs:
+            continue
+        for i, s in enumerate(segs):
+            if i < len(lines):
+                s["translation"] = lines[i]
+        if len(lines) > len(segs):
+            segs[-1]["translation"] = " ".join(lines[len(segs) - 1:])
+        for s in segs:
+            if s.get("translation"):
+                s["trans_lang"] = target_lang
     return segments
 
 
@@ -422,8 +447,10 @@ def list_voices(lang_prefix):
 
 
 def analyze_video(video_path, diarize_speakers=True, num_speakers=0,
-                  progress=None):
+                  target_lang=None, progress=None):
     """Phase 1 : extraction audio + transcription Whisper (+ diarisation).
+    Si target_lang est fourni, produit aussi une traduction proposée par
+    segment (éditable dans l'UI avant le rendu).
     Retourne un dict d'état à passer à render_video()."""
     def p(msg, frac):
         if progress:
@@ -452,10 +479,17 @@ def analyze_video(video_path, diarize_speakers=True, num_speakers=0,
     speakers = sorted({s["speaker"] for s in segments})
     genders = (estimate_genders(src_wav, segments, speakers)
                if len(speakers) > 1 else {})
+
+    trans_lang = None
+    if target_lang:
+        p("Traduction proposée…", 0.27)
+        translate_segments(segments, src_lang, target_lang)
+        trans_lang = target_lang
+
     p("Analyse terminée.", 0.3)
     return {"tmp": tmp, "src_wav": src_wav, "segments": segments,
             "src_lang": src_lang, "speakers": speakers, "genders": genders,
-            "total": media_duration(video_path)}
+            "trans_lang": trans_lang, "total": media_duration(video_path)}
 
 
 def default_output_dir(video_path):
@@ -471,8 +505,10 @@ def default_output_dir(video_path):
 
 
 def render_video(video_path, state, target_lang, speaker_voices,
-                 original_volume=0.1, output_dir=None, progress=None):
-    """Phase 2 : traduction + synthèse par locuteur + mixage."""
+                 original_volume=0.1, output_dir=None,
+                 edited_translations=None, progress=None):
+    """Phase 2 : traduction (corrigée par l'utilisateur si fournie)
+    + synthèse par locuteur + mixage."""
     def p(msg, frac):
         if progress:
             progress(msg, frac)
@@ -481,8 +517,15 @@ def render_video(video_path, state, target_lang, speaker_voices,
     dub_wav = os.path.join(tmp, "dub.wav")
     default_voice = DEFAULT_VOICES.get(target_lang, "en-US-AriaNeural")
 
-    p("Traduction…", 0.35)
-    translate_segments(segments, state["src_lang"], target_lang)
+    if edited_translations:
+        apply_edited_translations(segments, edited_translations,
+                                  target_lang)
+    stale = [s for s in segments
+             if not s.get("translation")
+             or s.get("trans_lang") != target_lang]
+    if stale:
+        p("Traduction…", 0.35)
+        translate_segments(stale, state["src_lang"], target_lang)
 
     tts_wavs = []
     for i, seg in enumerate(segments):
@@ -553,8 +596,9 @@ def preview_voice(state, speaker, voice, target_lang, max_seconds=30.0,
     src = state["src_lang"] if state["src_lang"] != "auto" else "auto"
     buf = bytearray()
     for i, s in enumerate(chosen):
-        if "translation" not in s:
+        if "translation" not in s or s.get("trans_lang") != target_lang:
             s["translation"] = _gtranslate(s["text"], src, target_lang)
+            s["trans_lang"] = target_lang
         mp3 = os.path.join(tmp, f"prev_{speaker}_{i}.mp3")
         wav = os.path.join(tmp, f"prev_{speaker}_{i}.wav")
         synthesize(s["translation"], voice, mp3)
@@ -592,5 +636,5 @@ def dub_video(video_path, target_lang, voice=None, original_volume=0.1,
                           voice or DEFAULT_VOICES.get(
                               target_lang, "en-US-AriaNeural")}
     out = render_video(video_path, state, target_lang, speaker_voices,
-                       original_volume, progress)
+                       original_volume=original_volume, progress=progress)
     return out, state["src_lang"], state["segments"], speaker_voices

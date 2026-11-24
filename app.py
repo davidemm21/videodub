@@ -170,8 +170,10 @@ def analyze(video, lang_name, multi, num_spk, local_path,
     lang = LANGS[lang_name]
     busy = gr.update(value=MSG_BUSY, visible=True,
                      elem_classes="vd-blink")
-    # par locuteur : row + dropdown ; + accordéon ; + 6 lecteurs ; + statut
-    hidden = ([gr.update(visible=False), gr.update()] * MAX_SPEAKERS
+    # par locuteur : col + dropdown + texte orig + texte trad ;
+    # + accordéon ; + 6 lecteurs ; + statut
+    hidden = ([gr.update(visible=False), gr.update(), gr.update(value=""),
+               gr.update(value="")] * MAX_SPEAKERS
               + [gr.update(visible=False)]
               + [gr.update(visible=False)] * MAX_SPEAKERS
               + [busy])
@@ -180,6 +182,7 @@ def analyze(video, lang_name, multi, num_spk, local_path,
     def work(report):
         return dubbing.analyze_video(src, diarize_speakers=multi,
                                      num_speakers=int(num_spk or 0),
+                                     target_lang=lang,
                                      progress=lambda m, f:
                                      report(m, min(f, 0.33)))
 
@@ -218,15 +221,22 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                         "Female": "voix aiguë (F)",
                         "Unknown": "genre ?"}.get(g, "")
                 updates += [
-                    gr.update(visible=True),   # la ligne complète
+                    gr.update(visible=True),   # le bloc complet
                     gr.update(visible=True, choices=choices, value=voices[sp],
                               label=f"Locuteur {i + 1}"
                                     f"{f' — {gtxt}' if gtxt else ''} — "
                                     f"{len(segs)} segments, {t:.0f}s — "
                                     f"« {sample} »"),
+                    gr.update(value="\n".join(s["text"] for s in segs)),
+                    gr.update(value="\n".join(s.get("translation", "")
+                                             for s in segs)),
                 ]
             else:
-                updates += [gr.update(visible=False), gr.update()]
+                updates += [gr.update(visible=False), gr.update(),
+                            gr.update(), gr.update()]
+        lines.append("✏️ **Corrige les traductions** dans les zones de "
+                     "droite (1 ligne = 1 segment) puis clique "
+                     "« Générer la vidéo doublée ».")
         if n > MAX_SPEAKERS:
             lines.append(f"⚠️ {n - MAX_SPEAKERS} locuteurs supplémentaires "
                          f"utiliseront la voix du locuteur {MAX_SPEAKERS}.")
@@ -236,7 +246,14 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                + [gr.update(visible=False)])                   # statut
 
 
-def render(video, lang_name, keep, local_path, state, *voice_dd,
+def _collect_edits(speakers, trad_vals):
+    """Textes de traduction édités par locuteur (zones non vides)."""
+    return {sp: trad_vals[i] for i, sp in enumerate(speakers)
+            if i < MAX_SPEAKERS
+            and trad_vals[i] and trad_vals[i].strip()}
+
+
+def render(video, lang_name, keep, local_path, state, *vals,
            progress=gr.Progress()):
     if not lang_name:
         raise gr.Error("Choisis d'abord la langue cible.")
@@ -245,6 +262,8 @@ def render(video, lang_name, keep, local_path, state, *voice_dd,
     src = _resolve_source(video, local_path)
     lang = LANGS[lang_name]
     speakers = state["speakers"]
+    voice_dd, trad_vals = vals[:MAX_SPEAKERS], vals[MAX_SPEAKERS:]
+    edited = _collect_edits(speakers, trad_vals)
     speaker_voices = {}
     for i, sp in enumerate(speakers):
         if i < MAX_SPEAKERS and voice_dd[i]:
@@ -260,6 +279,7 @@ def render(video, lang_name, keep, local_path, state, *voice_dd,
     def work(report):
         return dubbing.render_video(src, state, lang, speaker_voices,
                                     original_volume=keep, output_dir=out_dir,
+                                    edited_translations=edited,
                                     progress=lambda m, f:
                                     report(m, 0.33 + 0.67 * f))
 
@@ -306,16 +326,31 @@ with gr.Blocks(title="Video Dubber", css=CSS) as demo:
             summary = gr.Markdown("En attente d'une vidéo…")
 
             speaker_rows, voice_dds, orig_btns = [], [], []
+            orig_txts, trad_txts = [], []
             for i in range(MAX_SPEAKERS):
-                with gr.Row(visible=False) as row:
-                    dd = gr.Dropdown(allow_custom_value=True,
-                                     interactive=True, scale=4,
-                                     label=f"Voix neurale locuteur {i + 1}")
-                    btn_o = gr.Button("🔊 Original", scale=1, min_width=90,
-                                      size="sm")
-                speaker_rows.append(row)
+                with gr.Column(visible=False) as col:
+                    with gr.Row():
+                        dd = gr.Dropdown(
+                            allow_custom_value=True,
+                            interactive=True, scale=4,
+                            label=f"Voix neurale locuteur {i + 1}")
+                        btn_o = gr.Button("🔊 Original", scale=1,
+                                          min_width=90, size="sm")
+                    with gr.Row():
+                        t_orig = gr.Textbox(
+                            label=f"Texte original — locuteur {i + 1}",
+                            interactive=False, lines=6, max_lines=12)
+                        t_trad = gr.Textbox(
+                            label=f"Traduction — locuteur {i + 1} "
+                                  f"(éditable · 1 ligne = 1 segment)",
+                            interactive=True, lines=6, max_lines=12,
+                            info="Corrige librement ; la vidéo utilisera "
+                                 "ce texte pour la voix.")
+                speaker_rows.append(col)
                 voice_dds.append(dd)
                 orig_btns.append(btn_o)
+                orig_txts.append(t_orig)
+                trad_txts.append(t_trad)
 
             with gr.Accordion("Écouter les voix (~30 s de chaque)",
                               open=True, visible=False) as acc_listen:
@@ -330,10 +365,15 @@ with gr.Blocks(title="Video Dubber", css=CSS) as demo:
             out_video = gr.Video(label="Vidéo doublée")
             info = gr.Textbox(label="Info", interactive=False)
 
-    def listen(state, lang_name, *voice_dd, progress=gr.Progress()):
+    def listen(state, lang_name, *vals, progress=gr.Progress()):
         if not state:
             raise gr.Error("Lance d'abord l'analyse (étape 1).")
         lang = LANGS[lang_name]
+        voice_dd, trad_vals = vals[:MAX_SPEAKERS], vals[MAX_SPEAKERS:]
+        edited = _collect_edits(state["speakers"], trad_vals)
+        if edited:
+            dubbing.apply_edited_translations(
+                state["segments"], edited, lang)
         outs = []
         for i in range(MAX_SPEAKERS):
             sp = state["speakers"][i] if i < len(state["speakers"]) else None
@@ -359,11 +399,37 @@ with gr.Blocks(title="Video Dubber", css=CSS) as demo:
         return gr.update(visible=True, value=path,
                          label=f"Locuteur {i + 1} — voix ORIGINALE")
 
+    def retranslate(state, lang_name):
+        """Re-traduit les zones éditables si la langue a changé après
+        l'analyse (les corrections obsolètes sont remplacées)."""
+        noop = [gr.update()] * MAX_SPEAKERS
+        if not state or not lang_name:
+            return noop
+        code = LANGS[lang_name]
+        if state.get("trans_lang") == code:
+            return noop
+        dubbing.translate_segments(state["segments"], state["src_lang"],
+                                   code)
+        state["trans_lang"] = code
+        outs = []
+        for i in range(MAX_SPEAKERS):
+            if i < len(state["speakers"]):
+                sp = state["speakers"][i]
+                segs = [s for s in state["segments"]
+                        if s.get("speaker") == sp]
+                outs.append(gr.update(
+                    value="\n".join(s.get("translation", "")
+                                    for s in segs)))
+            else:
+                outs.append(gr.update())
+        return outs
+
     state = gr.State(None)
 
     def reset():
         return ([gr.update(value="En attente d'une vidéo…"), None]
-                + [gr.update(visible=False), gr.update()] * MAX_SPEAKERS
+                + [gr.update(visible=False), gr.update(),
+                   gr.update(value=""), gr.update(value="")] * MAX_SPEAKERS
                 + [gr.update(visible=False)]            # accordéon
                 + [gr.update(visible=False)] * MAX_SPEAKERS  # audios
                 + [gr.update(value=MSG_WAIT, visible=True,
@@ -372,8 +438,9 @@ with gr.Blocks(title="Video Dubber", css=CSS) as demo:
     demo.load(health_report, None, health)
 
     analyze_outputs = ([summary, state]
-                       + [c for pair in zip(speaker_rows, voice_dds)
-                          for c in pair]
+                       + [c for quad in zip(speaker_rows, voice_dds,
+                                            orig_txts, trad_txts)
+                          for c in quad]
                        + [acc_listen] + previews + [status_msg])
     gate_inputs = [in_video, lang, local_path] + voice_dds
     gate_outputs = [status_msg, btn_an] + voice_dds
@@ -383,14 +450,16 @@ with gr.Blocks(title="Video Dubber", css=CSS) as demo:
     in_video.clear(reset, None, analyze_outputs).then(
         gate, gate_inputs, gate_outputs)
     local_path.change(gate, gate_inputs, gate_outputs)
-    lang.change(gate, gate_inputs, gate_outputs)
+    lang.change(gate, gate_inputs, gate_outputs).then(
+        retranslate, [state, lang], trad_txts)
     btn_an.click(analyze, [in_video, lang, multi, num_spk, local_path],
                  analyze_outputs)
-    btn_listen.click(listen, [state, lang] + voice_dds, previews)
+    btn_listen.click(listen, [state, lang] + voice_dds + trad_txts,
+                     previews)
     for i, btn_o in enumerate(orig_btns):
         btn_o.click(partial(play_original, i), [state], previews[i])
     btn_go.click(render, [in_video, lang, keep, local_path, state]
-                 + voice_dds, [out_video, info])
+                 + voice_dds + trad_txts, [out_video, info])
 
 if __name__ == "__main__":
     # Synchro GitHub : pousse chaque modification après 30 s de stabilité
