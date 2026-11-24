@@ -63,6 +63,16 @@ LANGS = {
 }
 MAX_SPEAKERS = 6
 
+CSS = """
+@keyframes vd-blink { 50% { opacity: 0.25; } }
+.vd-blink { animation: vd-blink 1s ease-in-out infinite;
+            color: #d97706; font-weight: 600; }
+.vd-ready { color: #16a34a; font-weight: 600; }
+"""
+MSG_WAIT = "En attente d'une vidéo et d'une langue cible…"
+MSG_READY = "✅ Vidéo prête à être analysée"
+MSG_BUSY = "⏳ Vidéo en cours d'analyse…"
+
 
 def health_report():
     """Vérifications au démarrage -> markdown affiché en haut de page."""
@@ -77,12 +87,34 @@ def health_report():
     return header + "\n\n" + "  \n".join(lines)
 
 
-def refresh_voices(lang_name):
+def gate(video, lang_name, local_path, *voice_vals):
+    """Verrouille le bouton Analyser + message de statut + voix compatibles."""
+    src = (local_path or "").strip() or video
+    has_src = bool(src) and os.path.exists(src)
+
+    if not lang_name:
+        msg = "🈯 Choisis la langue cible pour continuer" if has_src \
+            else MSG_WAIT
+        return ([gr.update(value=msg, visible=True, elem_classes=""),
+                 gr.update(interactive=False)]
+                + [gr.update()] * MAX_SPEAKERS)
+
+    if not has_src:
+        return ([gr.update(value="Charge une vidéo ou indique son chemin",
+                          visible=True, elem_classes=""),
+                 gr.update(interactive=False)]
+                + [gr.update()] * MAX_SPEAKERS)
+
+    # Vidéo + langue OK -> prêt ; voix = uniquement celles de la langue
     code = LANGS[lang_name]
     voices = dubbing.list_voices(code)
-    default = dubbing.DEFAULT_VOICES.get(code, voices[0])
-    return gr.update(choices=voices,
-                     value=default if default in voices else voices[0])
+    fallback = dubbing.DEFAULT_VOICES.get(code, voices[0])
+    dd_updates = [gr.update(
+        choices=voices,
+        value=v if v in voices else fallback) for v in voice_vals]
+    return ([gr.update(value=MSG_READY, visible=True,
+                      elem_classes="vd-ready"),
+             gr.update(interactive=True)] + dd_updates)
 
 
 def _run_with_status(work, progress):
@@ -132,12 +164,17 @@ def _resolve_source(video, local_path):
 
 def analyze(video, lang_name, multi, num_spk, local_path,
             progress=gr.Progress()):
+    if not lang_name:
+        raise gr.Error("Choisis d'abord la langue cible.")
     src = _resolve_source(video, local_path)
     lang = LANGS[lang_name]
-    # par locuteur : row + dropdown ; + accordéon ; + 6 lecteurs audio
+    busy = gr.update(value=MSG_BUSY, visible=True,
+                     elem_classes="vd-blink")
+    # par locuteur : row + dropdown ; + accordéon ; + 6 lecteurs ; + statut
     hidden = ([gr.update(visible=False), gr.update()] * MAX_SPEAKERS
               + [gr.update(visible=False)]
-              + [gr.update(visible=False)] * MAX_SPEAKERS)
+              + [gr.update(visible=False)] * MAX_SPEAKERS
+              + [busy])
     yield [_file_info(src) + "\n\n⏳ Analyse…", None] + hidden
 
     def work(report):
@@ -195,11 +232,14 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                          f"utiliseront la voix du locuteur {MAX_SPEAKERS}.")
         yield (["\n".join(lines), state] + updates
                + [gr.update(visible=True)]                     # accordéon
-               + [gr.update(visible=False)] * MAX_SPEAKERS)    # audios
+               + [gr.update(visible=False)] * MAX_SPEAKERS      # audios
+               + [gr.update(visible=False)])                   # statut
 
 
 def render(video, lang_name, keep, local_path, state, *voice_dd,
            progress=gr.Progress()):
+    if not lang_name:
+        raise gr.Error("Choisis d'abord la langue cible.")
     if not state:
         raise gr.Error("Lance d'abord l'analyse (étape 1).")
     src = _resolve_source(video, local_path)
@@ -230,7 +270,7 @@ def render(video, lang_name, keep, local_path, state, *voice_dd,
             yield payload, f"✅ Sauvée dans : {payload}"
 
 
-with gr.Blocks(title="Video Dubber") as demo:
+with gr.Blocks(title="Video Dubber", css=CSS) as demo:
     gr.Markdown("# Doublage vidéo local — multi-locuteurs\n"
                 "Transcription Whisper (local) + diarisation (local) → "
                 "traduction Google → voix neurales Edge-TTS (une par "
@@ -246,8 +286,10 @@ with gr.Blocks(title="Video Dubber") as demo:
                 placeholder="/Volumes/Mustang/Videos/ma_video.mp4",
                 info="Si renseigné : utilisé à la place de l'upload et la "
                      "vidéo doublée sera enregistrée dans le même dossier.")
-            lang = gr.Dropdown(list(LANGS), value="Français",
-                               label="Langue cible")
+            lang = gr.Dropdown(
+                list(LANGS), value=None,
+                label="Langue cible *",
+                info="Obligatoire — débloque le bouton Analyser")
             multi = gr.Checkbox(
                 value=True, label="Détecter plusieurs locuteurs",
                 info="Décoche pour forcer une seule voix (plus rapide)")
@@ -258,7 +300,9 @@ with gr.Blocks(title="Video Dubber") as demo:
                      "ex. : 2 pour un dialogue à deux")
             keep = gr.Slider(0, 0.5, value=0.1, step=0.05,
                              label="Voix originales en fond (0 = supprimées)")
-            btn_an = gr.Button("Analyser la vidéo", variant="primary")
+            status_msg = gr.Markdown(MSG_WAIT)
+            btn_an = gr.Button("Analyser la vidéo", variant="primary",
+                               interactive=False)
             summary = gr.Markdown("En attente d'une vidéo…")
 
             speaker_rows, voice_dds, orig_btns = [], [], []
@@ -321,16 +365,25 @@ with gr.Blocks(title="Video Dubber") as demo:
         return ([gr.update(value="En attente d'une vidéo…"), None]
                 + [gr.update(visible=False), gr.update()] * MAX_SPEAKERS
                 + [gr.update(visible=False)]            # accordéon
-                + [gr.update(visible=False)] * MAX_SPEAKERS)  # audios
+                + [gr.update(visible=False)] * MAX_SPEAKERS  # audios
+                + [gr.update(value=MSG_WAIT, visible=True,
+                            elem_classes="")])          # statut
 
     demo.load(health_report, None, health)
 
     analyze_outputs = ([summary, state]
                        + [c for pair in zip(speaker_rows, voice_dds)
                           for c in pair]
-                       + [acc_listen] + previews)
+                       + [acc_listen] + previews + [status_msg])
+    gate_inputs = [in_video, lang, local_path] + voice_dds
+    gate_outputs = [status_msg, btn_an] + voice_dds
 
-    in_video.clear(reset, None, analyze_outputs)
+    in_video.upload(reset, None, analyze_outputs).then(
+        gate, gate_inputs, gate_outputs)
+    in_video.clear(reset, None, analyze_outputs).then(
+        gate, gate_inputs, gate_outputs)
+    local_path.change(gate, gate_inputs, gate_outputs)
+    lang.change(gate, gate_inputs, gate_outputs)
     btn_an.click(analyze, [in_video, lang, multi, num_spk, local_path],
                  analyze_outputs)
     btn_listen.click(listen, [state, lang] + voice_dds, previews)
