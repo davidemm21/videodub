@@ -558,14 +558,21 @@ def analyze_video(video_path, diarize_speakers=True, num_speakers=0,
             "trans_lang": trans_lang, "total": media_duration(video_path)}
 
 
+_TMP_MARKERS = ("/gradio", tempfile.gettempdir(), "/var/folders",
+                "/private/tmp", "/private/var")
+
+
+def is_temp_path(path):
+    """Vrai si le chemin est un fichier temporaire (upload navigateur)."""
+    return any(m in os.path.dirname(os.path.abspath(path))
+               for m in _TMP_MARKERS)
+
+
 def default_output_dir(video_path):
     """Dossier de sortie : à côté de la source si c'est un vrai chemin
     utilisateur ; sinon ~/Downloads (upload navigateur = temp Gradio)."""
     d = os.path.dirname(os.path.abspath(video_path))
-    tmp_markers = ("/gradio", tempfile.gettempdir(), "/var/folders",
-                   "/private/tmp", "/private/var")
-    is_temp = any(m in d for m in tmp_markers)
-    if not is_temp and os.access(d, os.W_OK):
+    if not is_temp_path(video_path) and os.access(d, os.W_OK):
         return d
     return os.path.expanduser("~/Downloads")
 

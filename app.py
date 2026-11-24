@@ -299,10 +299,19 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                 else:
                     updates += [gr.update(visible=False), gr.update(),
                                 gr.update(), gr.update()]
+            save_dir = dubbing.default_output_dir(src)
             lines.append("✏️ **Corrige les traductions** dans les zones de "
                          "droite — sauvegarde automatique à chaque frappe "
-                         "(`*_traduction_NN_langue.txt` à côté de la vidéo) "
                          "puis clique « Générer la vidéo doublée ».")
+            lines.append(f"📁 Traductions sauvegardées dans : "
+                         f"`{save_dir}` "
+                         f"(`{os.path.basename(src)[:-4] or 'video'}"
+                         f"_traduction_NN_{lang}.txt`)")
+            if dubbing.is_temp_path(src):
+                lines.append("ℹ️ Vidéo chargée par upload : le dossier "
+                             "d'origine n'est pas accessible — pour "
+                             "sauvegarder à côté de la vidéo, utilise le "
+                             "champ « chemin local du fichier ».")
             if restored:
                 lines.append(f"💾 {restored} traduction(s) restaurée(s) "
                              f"depuis les fichiers de sauvegarde.")
@@ -474,9 +483,9 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                             label=f"Traduction — locuteur {i + 1} "
                                   f"(éditable · 1 paragraphe = 1 segment)",
                             interactive=True, lines=6, max_lines=12,
-                            info="Corrige librement ; sauvegardé "
-                                 "automatiquement à côté de la vidéo. "
-                                 "Les lignes vides sont ignorées.")
+                            info="Corrige librement ; sauvegarde "
+                                 "automatique (dossier indiqué après "
+                                 "l'analyse). Lignes vides ignorées.")
                 speaker_rows.append(col)
                 voice_dds.append(dd)
                 orig_btns.append(btn_o)
