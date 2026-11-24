@@ -365,7 +365,12 @@ def _get_chatterbox(progress=None):
     global _CHATTERBOX
     if _CHATTERBOX is None:
         import torch
+        import perth
         from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+        # resemble-perth 1.0.1 : le watermarker réel est None sur cette
+        # plateforme -> no-op, sinon le constructeur du modèle plante
+        if perth.PerthImplicitWatermarker is None:
+            perth.PerthImplicitWatermarker = perth.DummyWatermarker
         if progress:
             progress("Chargement du modèle de clonage Chatterbox…", 0.35)
         device = ("mps" if torch.backends.mps.is_available() else "cpu")
