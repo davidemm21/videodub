@@ -258,9 +258,7 @@ with gr.Blocks(title="Video Dubber") as demo:
                      "ex. : 2 pour un dialogue à deux")
             keep = gr.Slider(0, 0.5, value=0.1, step=0.05,
                              label="Voix originales en fond (0 = supprimées)")
-            btn_an = gr.Button("Analyser la vidéo", variant="secondary")
-            gr.Markdown("*L'analyse démarre automatiquement après "
-                        "l'upload.*")
+            btn_an = gr.Button("Analyser la vidéo", variant="primary")
             summary = gr.Markdown("En attente d'une vidéo…")
 
             speaker_rows, voice_dds, orig_btns = [], [], []
@@ -332,9 +330,6 @@ with gr.Blocks(title="Video Dubber") as demo:
                           for c in pair]
                        + [acc_listen] + previews)
 
-    # L'analyse démarre automatiquement dès que la vidéo est chargée
-    in_video.upload(analyze, [in_video, lang, multi, num_spk, local_path],
-                    analyze_outputs)
     in_video.clear(reset, None, analyze_outputs)
     btn_an.click(analyze, [in_video, lang, multi, num_spk, local_path],
                  analyze_outputs)
