@@ -534,7 +534,6 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
             btn_an = gr.Button("Analyser la vidéo", variant="primary",
                                interactive=False)
             summary = gr.Markdown("En attente d'une vidéo…")
-            warn_box = gr.HTML(visible=False)
 
             speaker_rows, voice_dds, orig_btns = [], [], []
             orig_txts, trad_txts = [], []
@@ -572,6 +571,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                                      label=f"Locuteur {i + 1}")
                             for i in range(MAX_SPEAKERS)]
         with gr.Column():
+            warn_box = gr.HTML(visible=False)
             btn_go = gr.Button("Générer la vidéo doublée",
                                variant="primary")
             out_video = gr.Video(label="Vidéo doublée")
