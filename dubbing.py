@@ -491,9 +491,9 @@ def synthesize_batch(items, progress=None):
 
 
 def fit_segments_parallel(jobs, progress=None, workers=4):
-    """jobs : [(raw_path, slot_seconds, wav_out, avail_seconds)] —
+    """jobs : [(raw_path, slot_seconds, wav_out, speed_factor)] —
     calage ffmpeg en parallèle. progress(done_count) à chaque fin.
-    Retourne les facteurs d'accélération requis, alignés sur jobs."""
+    Retourne les facteurs appliqués, alignés sur jobs."""
     from concurrent.futures import ThreadPoolExecutor
     done = [0]
 
@@ -577,22 +577,16 @@ def _atempo_chain(factor):
     return ",".join(parts)
 
 
-def fit_segment(mp3_path, slot_seconds, wav_out, avail_seconds=None):
-    """Convertit un mp3 TTS en wav calé sur le créneau du segment.
-    `avail_seconds` = temps réellement disponible en empruntant la pause
-    qui suit le segment (jusqu'au prochain segment) : c'est elle qui
-    décide de l'accélération, pas le créneau seul — ainsi la voix peut
-    déborder dans le silence suivant plutôt que d'être survoltée.
-    Retourne le facteur d'accélération requis (dur/avail) pour
-    permettre de signaler les traductions trop longues."""
+def fit_segment(mp3_path, slot_seconds, wav_out, speed_factor=1.0):
+    """Convertit un mp3 TTS en wav : applique l'accélération calculée
+    par plan_timeline (speed_factor), ou un léger étirement si l'audio
+    est nettement plus court que le créneau."""
     dur = wav_duration_from_file(mp3_path)
     if slot_seconds <= 0:
         slot_seconds = dur
-    avail = max(avail_seconds or slot_seconds, 0.05)
-    speed = dur / avail                    # >1 : audio plus long que le temps libre
     filters = []
-    if speed > 1.12:                       # trop long -> accélérer
-        filters.append(_atempo_chain(min(speed, 4.0)))
+    if speed_factor > 1.02:                # trop long -> accélérer
+        filters.append(_atempo_chain(min(speed_factor, 4.0)))
     elif dur / slot_seconds < 0.95 and slot_seconds - dur <= 1.5:
         # léger décalage : étirer doucement (min x0.85). Au-delà on
         # préfère la voix naturelle + silence en fin de créneau.
@@ -601,7 +595,7 @@ def fit_segment(mp3_path, slot_seconds, wav_out, avail_seconds=None):
     run([FFMPEG, "-y", "-i", mp3_path, "-ac", "1", "-ar", str(SAMPLE_RATE)]
         + (["-af", ",".join(filters)] if filters else [])
         + ["-c:a", "pcm_s16le", wav_out])
-    return speed
+    return speed_factor
 
 
 def wav_duration_from_file(path):
@@ -618,9 +612,10 @@ def build_dub_track(segments, tts_wavs, total_seconds, out_wav):
         if tts_wavs[i] is None:               # segment sans texte -> silence
             continue
         frames = read_wav_frames(tts_wavs[i])
-        start = int(seg["start"] * SAMPLE_RATE) * 2
-        next_start = (int(segments[i + 1]["start"] * SAMPLE_RATE) * 2
-                      if i + 1 < len(segments) else len(buf))
+        start = int(seg.get("aud_start", seg["start"]) * SAMPLE_RATE) * 2
+        next_start = (int(segments[i + 1].get(
+            "aud_start", segments[i + 1]["start"]) * SAMPLE_RATE) * 2
+            if i + 1 < len(segments) else len(buf))
         end = min(start + len(frames), next_start, len(buf))
         if end > start:
             buf[start:end] = frames[: end - start]
@@ -655,12 +650,14 @@ def mix_duck(src_wav, segments, tts_wavs, dub_wav, out_wav,
     for i, seg in enumerate(segments):
         if tts_wavs[i] is None:
             continue
-        s = int(seg["start"] * SAMPLE_RATE)
+        s = int(seg.get("aud_start", seg["start"]) * SAMPLE_RATE)
         # le ducking couvre l'étendue RÉELLE de l'audio doublé (qui peut
         # déborder dans la pause suivante), pas seulement le créneau
         with wave.open(tts_wavs[i], "rb") as w:
             frames = w.getnframes()
-        nxt = (int(segments[i + 1]["start"] * SAMPLE_RATE)
+        nxt = (int(segments[i + 1].get("aud_start",
+                                       segments[i + 1]["start"])
+                   * SAMPLE_RATE)
                if i + 1 < len(segments) else n)
         e = min(s + frames, nxt, n)
         a0, r1 = max(0, s - ramp), min(n, e + ramp)
@@ -874,17 +871,39 @@ def load_analysis(video_path, diarize_speakers, num_speakers):
     return data
 
 
-def _avail_slots(segments, total_seconds, margin=0.08):
-    """Temps libre réel par segment : jusqu'au début du segment suivant
-    (moins une marge de 80 ms) ou jusqu'à la fin de la vidéo. Permet à
-    une voix de déborder dans la pause qui suit au lieu d'être
-    exagérément accélérée."""
-    out = []
+def plan_timeline(segments, durations, total_seconds, margin=0.08):
+    """Placement réel de chaque voix doublée, en empruntant au maximum
+    les pauses entre les phrases :
+    - la voix peut prolonger dans la pause qui suit son segment ;
+    - si ça ne suffit pas, elle peut démarrer plus tôt dans la pause
+      qui précède (seulement le temps encore libre — l'allocation est
+      séquentielle, une pause n'est jamais promise deux fois) ;
+    - l'accélération n'est appliquée qu'en dernier recours.
+    durations[i] : durée TTS (mesurée ou estimée), None -> silence.
+    Retourne [{aud_start, speed}] — speed = durée/fenêtre requise."""
+    plan, prev_end = [], 0.0
     for i, seg in enumerate(segments):
-        nxt = (segments[i + 1]["start"] if i + 1 < len(segments)
-               else total_seconds)
-        out.append(max(nxt - margin, seg["start"] + 0.05) - seg["start"])
-    return out
+        dur = durations[i] if i < len(durations) else None
+        end_avail = (segments[i + 1]["start"] - margin
+                     if i + 1 < len(segments) else total_seconds)
+        gap_before = max(0.0, seg["start"] - prev_end - margin)
+        if not dur:
+            plan.append({"aud_start": seg["start"], "speed": 1.0})
+            prev_end = seg["end"]
+            continue
+        aud_start = seg["start"]
+        win = max(end_avail - aud_start, 0.05)
+        if dur > win and gap_before > 0:
+            # pas assez de place en débordant : avancer le début dans
+            # la pause précédente élargit la fenêtre sans accélérer
+            borrow = min(gap_before, dur - win)
+            aud_start = max(0.0, aud_start - borrow)
+            win = end_avail - aud_start
+        speed = dur / max(win, 0.05)
+        applied = min(max(speed, 1.0), 4.0) if speed > 1.02 else 1.0
+        prev_end = aud_start + dur / applied
+        plan.append({"aud_start": aud_start, "speed": speed})
+    return plan
 
 
 def estimate_speech_seconds(text, lang=None):
@@ -896,24 +915,26 @@ def estimate_speech_seconds(text, lang=None):
 
 
 def translation_warnings(segments, total_seconds, lang=None,
-                         speeds=None, threshold=1.4):
-    """Segments dont la traduction est trop longue pour le temps libre.
-    `speeds` : facteurs réels mesurés post-TTS ; sinon estimation sur
-    le texte. Retourne des dicts {index, speaker, start, end, speed,
-    text, translation}."""
-    avails = _avail_slots(segments, total_seconds)
+                         plan=None, threshold=1.4):
+    """Segments dont la traduction est trop longue pour le temps libre
+    (pauses avant/après incluses). `plan` : résultat de plan_timeline
+    mesuré post-TTS ; sinon estimé depuis le texte. Retourne des dicts
+    {index, speaker, start, end, speed, text, translation}."""
+    if plan is None:
+        est = [estimate_speech_seconds(s.get("translation"), lang)
+               if (s.get("translation") or "").strip() else None
+               for s in segments]
+        plan = plan_timeline(segments, est, total_seconds)
     out = []
     for i, seg in enumerate(segments):
         trad = (seg.get("translation") or "").strip()
         if not trad:
             continue
-        sp = (speeds[i] if speeds is not None
-              else estimate_speech_seconds(trad, lang)
-              / max(avails[i], 0.05))
-        if sp > threshold:
+        if plan[i]["speed"] > threshold:
             out.append({"index": i, "speaker": seg.get("speaker", 0),
                         "start": seg["start"], "end": seg["end"],
-                        "speed": sp, "text": seg.get("text", ""),
+                        "speed": plan[i]["speed"],
+                        "text": seg.get("text", ""),
                         "translation": trad})
     return out
 
@@ -951,8 +972,7 @@ def render_video(video_path, state, target_lang, speaker_voices,
             clone_refs[sp] = original_excerpt(state, sp)
 
     tts_wavs = [None] * len(segments)
-    avails = _avail_slots(segments, state["total"])
-    speeds = [1.0] * len(segments)
+    raw_map = {}                       # index segment -> audio TTS brut
     if clone_voices:
         # Clonage : séquentiel (le modèle MPS ne parallélise pas)
         for i, seg in enumerate(segments):
@@ -961,16 +981,13 @@ def render_video(video_path, state, target_lang, speaker_voices,
                 continue
             sp = seg.get("speaker", 0)
             raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
-            wav = os.path.join(tmp, f"seg_{i:04d}.wav")
             synthesize_clone(text, clone_refs[sp], target_lang, raw)
-            speeds[i] = fit_segment(raw, seg["end"] - seg["start"], wav,
-                                    avails[i])
-            tts_wavs[i] = wav
+            raw_map[i] = raw
             p(f"Clonage {i + 1}/{len(segments)} (locuteur {sp + 1})",
-              0.4 + 0.4 * (i + 1) / len(segments))
+              0.4 + 0.3 * (i + 1) / len(segments))
     else:
-        # Voix neurales : TTS en parallèle puis calage en parallèle
-        jobs, fit_jobs = [], []
+        # Voix neurales : TTS en parallèle
+        jobs = []
         for i, seg in enumerate(segments):
             text = (seg.get("translation") or "").strip()
             if not text:
@@ -979,21 +996,41 @@ def render_video(video_path, state, target_lang, speaker_voices,
             voice = speaker_voices.get(sp, default_voice)
             raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
             jobs.append((text, voice, raw))
-            fit_jobs.append((i, raw, seg["end"] - seg["start"],
-                             os.path.join(tmp, f"seg_{i:04d}.wav"),
-                             avails[i]))
+            raw_map[i] = raw
         n = max(len(jobs), 1)
         synthesize_batch(
             jobs,
             progress=lambda d: p(f"Synthèse vocale {d}/{len(jobs)}",
                                  0.4 + 0.3 * d / n))
-        fit_speeds = fit_segments_parallel(
-            [(r, slot, w, a) for _, r, slot, w, a in fit_jobs],
+
+    # --- calage : durées mesurées + planification dans les pauses ---
+    p("Calage temporel…", 0.72)
+    idxs = sorted(raw_map)
+    if idxs:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            durs = list(ex.map(wav_duration_from_file,
+                               [raw_map[i] for i in idxs]))
+        durations = [None] * len(segments)
+        for i, d in zip(idxs, durs):
+            durations[i] = d
+        plan = plan_timeline(segments, durations, state["total"])
+        fit_jobs = []
+        for i in idxs:
+            seg = segments[i]
+            seg["aud_start"] = plan[i]["aud_start"]
+            fit_jobs.append((raw_map[i], seg["end"] - seg["start"],
+                             os.path.join(tmp, f"seg_{i:04d}.wav"),
+                             plan[i]["speed"]))
+        fit_segments_parallel(
+            fit_jobs,
             progress=lambda d: p(f"Calage temporel {d}/{len(fit_jobs)}",
-                                 0.7 + 0.1 * d / n))
-        for (i, raw, slot, wav, _a), spd in zip(fit_jobs, fit_speeds):
+                                 0.72 + 0.08 * d / n))
+        for i, _raw, _slot, wav, _f in fit_jobs:
             tts_wavs[i] = wav
-            speeds[i] = spd
+        speeds = [plan[i]["speed"] for i in range(len(segments))]
+    else:
+        speeds = [1.0] * len(segments)
 
     p("Assemblage de la piste doublée…", 0.85)
     build_dub_track(segments, tts_wavs, state["total"], dub_wav)
@@ -1008,8 +1045,11 @@ def render_video(video_path, state, target_lang, speaker_voices,
     out_path = os.path.join(out_dir, f"{base}_{tag}{target_lang}.mp4")
     mux(video_path, mix_wav, out_path, original_volume)
 
-    warnings = translation_warnings(segments, state["total"],
-                                    speeds=speeds, threshold=1.5)
+    warnings = translation_warnings(
+        segments, state["total"],
+        plan=[{"speed": s, "aud_start": sg.get("aud_start", sg["start"])}
+              for s, sg in zip(speeds, segments)],
+        threshold=1.5)
     p("Terminé.", 1.0)
     return out_path, warnings
 
