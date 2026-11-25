@@ -580,7 +580,8 @@ def elevenlabs_clone_voice(state, speaker):
     with open(excerpt, "rb") as f:
         v = client.voices.ivc.create(
             name=f"VideoDubber {base[:20]} L{speaker + 1}",
-            files=[f], remove_background_noise=True)
+            files=[f], remove_background_noise=True,
+            labels={"app": "videodubber"})
     return v.voice_id
 
 
