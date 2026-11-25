@@ -414,7 +414,15 @@ def render(video, lang_name, keep, local_path, state, clone, *vals,
                 yield None, (f"⏳ {_prog_bar(frac)} "
                              f"{int(frac * 100):3d} % — {payload}")
             else:
-                yield payload, f"✅ Vidéo sauvée dans : {payload}"
+                out_path, warns = payload
+                msg = f"✅ Vidéo sauvée dans : {out_path}"
+                if warns:
+                    msg += ("\n\n⚠️ Voix fortement accélérées — traduction "
+                            "trop longue pour le temps disponible : "
+                            + ", ".join(warns)
+                            + ". Raccourcis le texte dans la zone de "
+                            "traduction puis régénère.")
+                yield out_path, msg
     except Exception as e:
         yield None, f"❌ Erreur pendant la génération : {e}"
 
