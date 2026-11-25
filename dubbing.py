@@ -570,10 +570,75 @@ def elevenlabs_available():
     return bool(os.environ.get("ELEVENLABS_API_KEY"))
 
 
+def elevenlabs_excerpt(state, speaker, min_seconds=5.0):
+    """Extrait ≥ ~5 s pour l'Instant Voice Clone (ElevenLabs exige
+    ≥ 4,6 s d'échantillon). Concatène les segments du locuteur en
+    élargissant leurs fenêtres dans les pauses adjacentes quand la
+    parole seule est trop courte, sans inclure les segments des autres
+    locuteurs."""
+    segs = [s for s in state["segments"] if s.get("speaker", 0) == speaker]
+    if not segs:
+        raise RuntimeError(f"locuteur {speaker + 1} : aucun segment")
+    with wave.open(state["src_wav"], "rb") as w:
+        n = w.getnframes()
+        audio = w.readframes(n)
+    dur = n / SAMPLE_RATE
+    if dur < 4.6:
+        raise RuntimeError(
+            f"vidéo trop courte pour le clonage ElevenLabs "
+            f"({dur:.1f} s < 4,6 s minimum) — utilise les voix "
+            "neurales ou Chatterbox pour celle-ci")
+
+    other = [(s["start"], s["end"]) for s in state["segments"]
+             if s.get("speaker", 0) != speaker]
+    pad, windows = 0.15, []
+    for _ in range(8):
+        windows = []
+        for s in segs:
+            a, b = s["start"] - pad, s["end"] + pad
+            for oa, ob in other:
+                if ob <= s["start"]:
+                    a = max(a, ob + 0.02)
+                if oa >= s["end"]:
+                    b = min(b, oa - 0.02)
+            windows.append((max(0.0, a), min(dur, b)))
+        if sum(b - a for a, b in windows) >= min_seconds:
+            break
+        pad *= 1.8
+
+    merged = []
+    for a, b in windows:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+
+    def frames(s, e):
+        return audio[int(s * SAMPLE_RATE) * 2:int(e * SAMPLE_RATE) * 2]
+
+    buf = bytearray()
+    for a, b in merged:
+        buf += frames(a, b)
+        buf += b"\x00" * int(0.25 * SAMPLE_RATE) * 2
+    buf = buf[:int(30 * SAMPLE_RATE) * 2]
+    if len(buf) < int(4.6 * SAMPLE_RATE) * 2:
+        raise RuntimeError(
+            f"locuteur {speaker + 1} : extrait trop court pour le "
+            "clonage ElevenLabs (< 4,6 s) — utilise les voix neurales "
+            "ou Chatterbox")
+    out = os.path.join(state["tmp"], f"original_{speaker}_ivc.wav")
+    with wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(bytes(buf))
+    return out
+
+
 def elevenlabs_clone_voice(state, speaker):
     """Instant Voice Clone du locuteur depuis son extrait original.
     Retourne un voice_id temporaire (à supprimer après le rendu)."""
-    excerpt = original_excerpt(state, speaker)
+    excerpt = elevenlabs_excerpt(state, speaker)
     base = os.path.splitext(os.path.basename(
         state.get("src_path") or "video"))[0]
     client = _get_elevenlabs()
