@@ -1026,7 +1026,7 @@ def render_video(video_path, state, target_lang, speaker_voices,
             fit_jobs,
             progress=lambda d: p(f"Calage temporel {d}/{len(fit_jobs)}",
                                  0.72 + 0.08 * d / n))
-        for i, _raw, _slot, wav, _f in fit_jobs:
+        for i, (_raw, _slot, wav, _f) in zip(idxs, fit_jobs):
             tts_wavs[i] = wav
         speeds = [plan[i]["speed"] for i in range(len(segments))]
     else:
