@@ -90,6 +90,22 @@ body, .gradio-container {
 .vd-blink { animation: vd-blink 1s ease-in-out infinite;
             color: #d97706; font-weight: 600; }
 .vd-ready { color: #16a34a; font-weight: 600; }
+/* ---- alerte traductions trop longues ---- */
+.vd-warnbox {
+  border: 1px solid #f59e0b; background: #fffbeb;
+  border-radius: 12px; padding: 12px 16px; margin: 10px 0;
+}
+.vd-warnbox > b { color: #92400e; }
+.vd-warnbox .vd-sub { font-size: .85rem; color: #a16207; margin: 4px 0 8px; }
+.vd-warn-seg {
+  margin: 6px 0; padding: 8px 10px;
+  background: #fff; border: 1px solid #fde68a; border-radius: 8px;
+}
+.vd-warn-seg .vd-time { font-size: 12px; color: #b45309; font-weight: 600; }
+.vd-warn-seg .vd-orig { color: #64748b; font-size: 13px; margin: 4px 0 2px; }
+.vd-warn-seg .vd-trad { font-size: 14px; color: #0f172a; }
+.vd-warn-seg mark { background: #fde68a; padding: 1px 4px;
+                    border-radius: 4px; }
 /* ---- pied de page ---- */
 body { padding-bottom: 46px; }
 .vd-footer {
@@ -225,12 +241,12 @@ def analyze(video, lang_name, multi, num_spk, local_path,
     busy = gr.update(value=MSG_BUSY, visible=True,
                      elem_classes="vd-blink")
     # par locuteur : col + dropdown + texte orig + texte trad ;
-    # + accordéon ; + 6 lecteurs ; + statut
+    # + accordéon ; + 6 lecteurs ; + statut ; + alerte trad. longues
     hidden = ([gr.update(visible=False), gr.update(), gr.update(value=""),
                gr.update(value="")] * MAX_SPEAKERS
               + [gr.update(visible=False)]
               + [gr.update(visible=False)] * MAX_SPEAKERS
-              + [busy])
+              + [busy, gr.update(visible=False)])
     yield [_file_info(src) + "\n\n⏳ Analyse…", None] + hidden
 
     nspk = int(num_spk or 0)
@@ -326,7 +342,8 @@ def analyze(video, lang_name, multi, num_spk, local_path,
             yield (["\n".join(lines), state] + updates
                    + [gr.update(visible=True)]                # accordéon
                    + [gr.update(visible=False)] * MAX_SPEAKERS  # audios
-                   + [gr.update(visible=False)])               # statut
+                   + [gr.update(visible=False)]                # statut
+                   + [_warn_update(state, lang)])              # alerte
     except Exception as e:
         yield ([f"❌ Erreur pendant l'analyse : {e}", None] + hidden)
         return
@@ -337,6 +354,46 @@ def _collect_edits(speakers, trad_vals):
     return {sp: trad_vals[i] for i, sp in enumerate(speakers)
             if i < MAX_SPEAKERS
             and trad_vals[i] and trad_vals[i].strip()}
+
+
+def _warn_html(items):
+    """Panneau listant les traductions trop longues pour le temps
+    disponible — passages surlignés, avec le texte original en regard."""
+    if not items:
+        return gr.update(visible=False)
+    import html as _h
+
+    def mmss(t):
+        return f"{int(t // 60)}:{int(t % 60):02d}"
+    cards = []
+    for it in items:
+        cards.append(
+            '<div class="vd-warn-seg">'
+            f'<span class="vd-time">Segment {it["index"] + 1} · '
+            f'Locuteur {it["speaker"] + 1} · '
+            f'{mmss(it["start"])} → {mmss(it["end"])} · '
+            f'×{it["speed"]:.1f} requis</span>'
+            f'<div class="vd-orig">🇬🇧 {_h.escape(it["text"][:160])}</div>'
+            f'<div class="vd-trad"><mark>{_h.escape(it["translation"])}'
+            '</mark></div></div>')
+    return gr.update(
+        visible=True,
+        value=('<div class="vd-warnbox">'
+               f'<b>⚠️ {len(items)} passage(s) trop long(s) — la voix '
+               'sera accélérée</b>'
+               '<div class="vd-sub">Les traductions surlignées dépassent '
+               'le temps de parole disponible. Raccourcis-les dans la '
+               'zone « Traduction — locuteur N » correspondante pour un '
+               'débit naturel, puis génère (ou régénère) la vidéo.</div>'
+               + "".join(cards) + '</div>'))
+
+
+def _warn_update(state, lang_code):
+    """Alerte préventive sur les traductions affichées (estimation)."""
+    if not state:
+        return gr.update(visible=False)
+    return _warn_html(dubbing.translation_warnings(
+        state["segments"], state["total"], lang_code))
 
 
 def _trad_value_or_saved(src, i, lang_code, proposed):
@@ -397,7 +454,7 @@ def render(video, lang_name, keep, local_path, state, clone, *vals,
                 speakers[min(i, MAX_SPEAKERS - 1)],
                 dubbing.DEFAULT_VOICES.get(lang, "en-US-AriaNeural"))
 
-    yield None, "⏳ Génération en cours…"
+    yield None, "⏳ Génération en cours…", gr.update(visible=False)
     out_dir = dubbing.default_output_dir(src)
 
     def work(report):
@@ -412,19 +469,19 @@ def render(video, lang_name, keep, local_path, state, clone, *vals,
         for kind, payload, frac in _run_with_status(work, progress):
             if kind == "status":
                 yield None, (f"⏳ {_prog_bar(frac)} "
-                             f"{int(frac * 100):3d} % — {payload}")
+                             f"{int(frac * 100):3d} % — {payload}"), \
+                    gr.update(visible=False)
             else:
                 out_path, warns = payload
                 msg = f"✅ Vidéo sauvée dans : {out_path}"
                 if warns:
-                    msg += ("\n\n⚠️ Voix fortement accélérées — traduction "
-                            "trop longue pour le temps disponible : "
-                            + ", ".join(warns)
-                            + ". Raccourcis le texte dans la zone de "
-                            "traduction puis régénère.")
-                yield out_path, msg
+                    msg += (f"\n\n⚠️ {len(warns)} passage(s) parlé(s) "
+                            "trop vite — voir le panneau d'alerte "
+                            "au-dessus des zones de traduction.")
+                yield out_path, msg, _warn_html(warns)
     except Exception as e:
-        yield None, f"❌ Erreur pendant la génération : {e}"
+        yield None, f"❌ Erreur pendant la génération : {e}", \
+            gr.update(visible=False)
 
 
 with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
@@ -477,6 +534,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
             btn_an = gr.Button("Analyser la vidéo", variant="primary",
                                interactive=False)
             summary = gr.Markdown("En attente d'une vidéo…")
+            warn_box = gr.HTML(visible=False)
 
             speaker_rows, voice_dds, orig_btns = [], [], []
             orig_txts, trad_txts = [], []
@@ -556,7 +614,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
     def retranslate(state, lang_name):
         """Re-traduit les zones éditables si la langue a changé après
         l'analyse (les corrections obsolètes sont remplacées)."""
-        noop = [gr.update()] * MAX_SPEAKERS
+        noop = [gr.update()] * MAX_SPEAKERS + [gr.update()]
         if not state or not lang_name:
             return noop
         code = LANGS[lang_name]
@@ -581,7 +639,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                 outs.append(gr.update(value=val))
             else:
                 outs.append(gr.update())
-        return outs
+        return outs + [_warn_update(state, code)]
 
     state = gr.State(None)
 
@@ -592,7 +650,8 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                 + [gr.update(visible=False)]            # accordéon
                 + [gr.update(visible=False)] * MAX_SPEAKERS  # audios
                 + [gr.update(value=MSG_WAIT, visible=True,
-                            elem_classes="")])          # statut
+                            elem_classes="")]           # statut
+                + [gr.update(visible=False)])           # alerte
 
     demo.load(health_report, None, health)
 
@@ -600,7 +659,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                        + [c for quad in zip(speaker_rows, voice_dds,
                                             orig_txts, trad_txts)
                           for c in quad]
-                       + [acc_listen] + previews + [status_msg])
+                       + [acc_listen] + previews + [status_msg, warn_box])
     gate_inputs = [in_video, lang, local_path] + voice_dds
     gate_outputs = [status_msg, btn_an] + voice_dds
 
@@ -610,7 +669,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
         gate, gate_inputs, gate_outputs)
     local_path.change(gate, gate_inputs, gate_outputs)
     lang.change(gate, gate_inputs, gate_outputs).then(
-        retranslate, [state, lang], trad_txts)
+        retranslate, [state, lang], trad_txts + [warn_box])
     btn_an.click(analyze, [in_video, lang, multi, num_spk, local_path],
                  analyze_outputs)
     btn_listen.click(listen, [state, lang] + voice_dds + trad_txts,
@@ -620,11 +679,24 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
     for i, t_trad in enumerate(trad_txts):
         t_trad.input(partial(save_trad, i),
                      [in_video, local_path, lang, t_trad], None)
+
+    def check_trads(state, lang_name, *trad_vals):
+        """Recalcule l'alerte « traduction trop longue » après édition."""
+        if not state or not lang_name:
+            return gr.update(visible=False)
+        edited = _collect_edits(state["speakers"], trad_vals)
+        if edited:
+            dubbing.apply_edited_translations(
+                state["segments"], edited, LANGS[lang_name])
+        return _warn_update(state, LANGS[lang_name])
+
+    for t_trad in trad_txts:
+        t_trad.change(check_trads, [state, lang] + trad_txts, warn_box)
     clone.change(
         lambda c: [gr.update(interactive=not c)] * MAX_SPEAKERS,
         clone, voice_dds)
     btn_go.click(render, [in_video, lang, keep, local_path, state, clone]
-                 + voice_dds + trad_txts, [out_video, info])
+                 + voice_dds + trad_txts, [out_video, info, warn_box])
 
     gr.HTML('<div class="vd-footer">— Copyright Emmanuel S. Davidson — '
             'Licensed to Aviation et Pilote 2026 —</div>')

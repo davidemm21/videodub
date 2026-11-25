@@ -861,6 +861,37 @@ def _avail_slots(segments, total_seconds, margin=0.08):
     return out
 
 
+def estimate_speech_seconds(text, lang=None):
+    """Durée parlée estimée avant TTS — ~13 car./s (langues latines,
+    ~6 car./s pour le CJK), marge 5 %."""
+    n = len(re.sub(r"\s+", "", text or ""))
+    rate = 6.0 if lang in ("ja", "zh", "ko") else 13.0
+    return n / rate * 1.05
+
+
+def translation_warnings(segments, total_seconds, lang=None,
+                         speeds=None, threshold=1.4):
+    """Segments dont la traduction est trop longue pour le temps libre.
+    `speeds` : facteurs réels mesurés post-TTS ; sinon estimation sur
+    le texte. Retourne des dicts {index, speaker, start, end, speed,
+    text, translation}."""
+    avails = _avail_slots(segments, total_seconds)
+    out = []
+    for i, seg in enumerate(segments):
+        trad = (seg.get("translation") or "").strip()
+        if not trad:
+            continue
+        sp = (speeds[i] if speeds is not None
+              else estimate_speech_seconds(trad, lang)
+              / max(avails[i], 0.05))
+        if sp > threshold:
+            out.append({"index": i, "speaker": seg.get("speaker", 0),
+                        "start": seg["start"], "end": seg["end"],
+                        "speed": sp, "text": seg.get("text", ""),
+                        "translation": trad})
+    return out
+
+
 def render_video(video_path, state, target_lang, speaker_voices,
                  original_volume=0.1, output_dir=None,
                  edited_translations=None, clone_voices=False,
@@ -951,8 +982,8 @@ def render_video(video_path, state, target_lang, speaker_voices,
     out_path = os.path.join(out_dir, f"{base}_{tag}{target_lang}.mp4")
     mux(video_path, mix_wav, out_path, original_volume)
 
-    warnings = [f"segment {i + 1} (×{sp:.1f})"
-                for i, sp in enumerate(speeds) if sp > 1.5]
+    warnings = translation_warnings(segments, state["total"],
+                                    speeds=speeds, threshold=1.5)
     p("Terminé.", 1.0)
     return out_path, warnings
 
