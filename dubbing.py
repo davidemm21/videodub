@@ -797,6 +797,22 @@ def _analysis_wav(video_path):
                         f"{base}_analyse.wav")
 
 
+def _video_fingerprint(video_path):
+    """Empreinte de contenu : taille + sha1 des premier et dernier Mo.
+    Identique que la vidéo soit un chemin local ou une copie temporaire
+    d'upload navigateur (mtime différent, contenu identique)."""
+    import hashlib
+    h = hashlib.sha1()
+    size = os.path.getsize(video_path)
+    h.update(str(size).encode())
+    with open(video_path, "rb") as f:
+        h.update(f.read(1 << 20))
+        if size > (1 << 20):
+            f.seek(max(0, size - (1 << 20)))
+            h.update(f.read(1 << 20))
+    return h.hexdigest()
+
+
 def save_analysis(state, video_path, diarize_speakers, num_speakers):
     """Persiste l'état d'analyse + le wav extrait, pour reprendre
     sans relancer Whisper/diarisation."""
@@ -812,7 +828,7 @@ def save_analysis(state, video_path, diarize_speakers, num_speakers):
         data.update({"src_wav": wav_dst,
                      "diarize": diarize_speakers,
                      "num_speakers": num_speakers,
-                     "src_mtime": os.path.getmtime(video_path)})
+                     "fingerprint": _video_fingerprint(video_path)})
         with open(analysis_file(video_path), "w",
                   encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=1)
@@ -822,7 +838,7 @@ def save_analysis(state, video_path, diarize_speakers, num_speakers):
 
 def load_analysis(video_path, diarize_speakers, num_speakers):
     """Recharge une analyse sauvegardée si elle correspond aux mêmes
-    paramètres et à la même vidéo (mtime). None sinon."""
+    paramètres et à la même vidéo (empreinte de contenu). None sinon."""
     import json
     path = analysis_file(video_path)
     if not os.path.exists(path):
@@ -834,15 +850,25 @@ def load_analysis(video_path, diarize_speakers, num_speakers):
     wav = data.get("src_wav") or ""
     if not os.path.exists(wav):
         wav = _analysis_wav(video_path)
+    try:
+        fp = _video_fingerprint(video_path)
+    except OSError:
+        return None
+    stored_fp = data.get("fingerprint")
+    same_video = (stored_fp == fp if stored_fp
+                  else data.get("src_mtime")
+                  == os.path.getmtime(video_path))
     if (data.get("diarize") != diarize_speakers
             or data.get("num_speakers") != num_speakers
-            or data.get("src_mtime") != os.path.getmtime(video_path)
+            or not same_video
             or not data.get("segments")
             or not os.path.exists(wav)):
         return None
     data["src_wav"] = wav
     data["genders"] = {int(k): v for k, v in
                        data.get("genders", {}).items()}
+    data["src_path"] = video_path      # chemin courant (le JSON peut
+                                       # contenir un vieux temp d'upload)
     data["tmp"] = tempfile.mkdtemp(prefix="dub_")
     data["restored"] = True
     return data
