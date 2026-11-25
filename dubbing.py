@@ -765,6 +765,66 @@ def translation_file(video_path, speaker_index, target_lang):
         f"{base}_traduction_{speaker_index + 1:02d}_{target_lang}.txt")
 
 
+def analysis_file(video_path):
+    """JSON de l'état d'analyse, à côté de la vidéo source."""
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(default_output_dir(video_path),
+                        f"{base}_analyse.json")
+
+
+def _analysis_wav(video_path):
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    return os.path.join(default_output_dir(video_path),
+                        f"{base}_analyse.wav")
+
+
+def save_analysis(state, video_path, diarize_speakers, num_speakers):
+    """Persiste l'état d'analyse + le wav extrait, pour reprendre
+    sans relancer Whisper/diarisation."""
+    import json
+    import shutil
+    wav_dst = _analysis_wav(video_path)
+    try:
+        if os.path.abspath(state["src_wav"]) != os.path.abspath(wav_dst):
+            shutil.copy2(state["src_wav"], wav_dst)
+        data = {k: state[k] for k in
+                ("src_path", "src_lang", "speakers", "genders",
+                 "trans_lang", "total", "segments")}
+        data.update({"src_wav": wav_dst,
+                     "diarize": diarize_speakers,
+                     "num_speakers": num_speakers,
+                     "src_mtime": os.path.getmtime(video_path)})
+        with open(analysis_file(video_path), "w",
+                  encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+
+
+def load_analysis(video_path, diarize_speakers, num_speakers):
+    """Recharge une analyse sauvegardée si elle correspond aux mêmes
+    paramètres et à la même vidéo (mtime). None sinon."""
+    import json
+    path = analysis_file(video_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        data = json.load(open(path, encoding="utf-8"))
+    except Exception:
+        return None
+    if (data.get("diarize") != diarize_speakers
+            or data.get("num_speakers") != num_speakers
+            or data.get("src_mtime") != os.path.getmtime(video_path)
+            or not data.get("segments")
+            or not os.path.exists(data.get("src_wav") or "")):
+        return None
+    data["genders"] = {int(k): v for k, v in
+                       data.get("genders", {}).items()}
+    data["tmp"] = tempfile.mkdtemp(prefix="dub_")
+    data["restored"] = True
+    return data
+
+
 def render_video(video_path, state, target_lang, speaker_voices,
                  original_volume=0.1, output_dir=None,
                  edited_translations=None, clone_voices=False,

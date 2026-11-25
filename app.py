@@ -233,12 +233,19 @@ def analyze(video, lang_name, multi, num_spk, local_path,
               + [busy])
     yield [_file_info(src) + "\n\n⏳ Analyse…", None] + hidden
 
+    nspk = int(num_spk or 0)
+
     def work(report):
-        return dubbing.analyze_video(src, diarize_speakers=multi,
-                                     num_speakers=int(num_spk or 0),
-                                     target_lang=lang,
-                                     progress=lambda m, f:
-                                     report(m, min(f, 0.33)))
+        saved = dubbing.load_analysis(src, multi, nspk)
+        if saved:
+            report("Analyse chargée depuis la sauvegarde.", 0.3)
+            return saved
+        st = dubbing.analyze_video(src, diarize_speakers=multi,
+                                   num_speakers=nspk, target_lang=lang,
+                                   progress=lambda m, f:
+                                   report(m, min(f, 0.33)))
+        dubbing.save_analysis(st, src, multi, nspk)
+        return st
 
     try:
         for kind, payload, frac in _run_with_status(work, progress):
@@ -299,6 +306,10 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                 else:
                     updates += [gr.update(visible=False), gr.update(),
                                 gr.update(), gr.update()]
+            if state.get("restored"):
+                lines.append("💾 Analyse rechargée depuis la sauvegarde "
+                             f"`{os.path.basename(dubbing.analysis_file(src))}`"
+                             " — instantané, aucun recalcul.")
             save_dir = dubbing.default_output_dir(src)
             lines.append("✏️ **Corrige les traductions** dans les zones de "
                          "droite — sauvegarde automatique à chaque frappe "
