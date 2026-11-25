@@ -633,5 +633,5 @@ if __name__ == "__main__":
     threading.Thread(target=git_sync_watcher, daemon=True).start()
     demo.launch(inbrowser=True, max_file_size="20gb",
                 allowed_paths=[GIT_DIR,
-                               os.path.expanduser("~/Downloads"),
+                               os.path.expanduser("~"),
                                "/Volumes"])
