@@ -246,7 +246,7 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                gr.update(value="")] * MAX_SPEAKERS
               + [gr.update(visible=False)]
               + [gr.update(visible=False)] * MAX_SPEAKERS
-              + [busy, gr.update(visible=False)])
+              + [busy] + _warn_empty())
     yield [_file_info(src) + "\n\n⏳ Analyse…", None] + hidden
 
     nspk = int(num_spk or 0)
@@ -343,7 +343,7 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                    + [gr.update(visible=True)]                # accordéon
                    + [gr.update(visible=False)] * MAX_SPEAKERS  # audios
                    + [gr.update(visible=False)]                # statut
-                   + [_warn_update(state, lang)])              # alerte
+                   + _warn_outputs(state, lang))               # alerte
     except Exception as e:
         yield ([f"❌ Erreur pendant l'analyse : {e}", None] + hidden)
         return
@@ -356,44 +356,64 @@ def _collect_edits(speakers, trad_vals):
             and trad_vals[i] and trad_vals[i].strip()}
 
 
-def _warn_html(items):
-    """Panneau listant les traductions trop longues pour le temps
-    disponible — passages surlignés, avec le texte original en regard."""
+MAX_WARNS = 8
+
+
+def _warn_empty():
+    """Sorties « panneau masqué » : en-tête + map + MAX_WARNS blocs."""
+    return ([gr.update(visible=False), []]
+            + [gr.update(visible=False), gr.update(), gr.update()]
+            * MAX_WARNS)
+
+
+def _warn_head(items):
+    """En-tête du panneau d'alerte (les passages sont éditables juste
+    en dessous, un bloc par segment trop long)."""
     if not items:
         return gr.update(visible=False)
-    import html as _h
-
-    def mmss(t):
-        return f"{int(t // 60)}:{int(t % 60):02d}"
-    cards = []
-    for it in items:
-        cards.append(
-            '<div class="vd-warn-seg">'
-            f'<span class="vd-time">Segment {it["index"] + 1} · '
-            f'Locuteur {it["speaker"] + 1} · '
-            f'{mmss(it["start"])} → {mmss(it["end"])} · '
-            f'×{it["speed"]:.1f} requis</span>'
-            f'<div class="vd-orig">🇬🇧 {_h.escape(it["text"][:160])}</div>'
-            f'<div class="vd-trad"><mark>{_h.escape(it["translation"])}'
-            '</mark></div></div>')
+    extra = (f" (+{len(items) - MAX_WARNS} autre(s) — corrige d'abord "
+             "ceux-ci)" if len(items) > MAX_WARNS else "")
     return gr.update(
         visible=True,
         value=('<div class="vd-warnbox">'
                f'<b>⚠️ {len(items)} passage(s) trop long(s) — la voix '
-               'sera accélérée</b>'
-               '<div class="vd-sub">Les traductions surlignées dépassent '
-               'le temps de parole disponible. Raccourcis-les dans la '
-               'zone « Traduction — locuteur N » correspondante pour un '
-               'débit naturel, puis génère (ou régénère) la vidéo.</div>'
-               + "".join(cards) + '</div>'))
+               f'sera accélérée{extra}</b>'
+               '<div class="vd-sub">Corrige directement les traductions '
+               'ci-dessous : chaque zone est synchronisée avec la grande '
+               'zone « Traduction — locuteur N ». Une fois le passage '
+               'assez court, son alerte disparaît.</div></div>'))
 
 
-def _warn_update(state, lang_code):
-    """Alerte préventive sur les traductions affichées (estimation)."""
-    if not state:
-        return gr.update(visible=False)
-    return _warn_html(dubbing.translation_warnings(
-        state["segments"], state["total"], lang_code))
+def _warn_outputs(state, lang_code, items=None):
+    """Sorties du panneau d'alerte : en-tête + jusqu'à MAX_WARNS blocs
+    éditables. `items` : avertissements déjà calculés (mesure exacte
+    post-génération) ; sinon estimation sur les traductions du state."""
+    if not state or not lang_code:
+        return _warn_empty()
+    if items is None:
+        items = dubbing.translation_warnings(
+            state["segments"], state["total"], lang_code)
+    if not items:
+        return _warn_empty()
+    out = [_warn_head(items),
+           [it["index"] for it in items[:MAX_WARNS]]]
+    for j in range(MAX_WARNS):
+        if j < len(items):
+            it = items[j]
+            t0, t1 = it["start"], it["end"]
+            md = (f"**Segment {it['index'] + 1}** · locuteur "
+                  f"{it['speaker'] + 1} · "
+                  f"{int(t0 // 60)}:{int(t0 % 60):02d} → "
+                  f"{int(t1 // 60)}:{int(t1 % 60):02d} · "
+                  f"**×{it['speed']:.1f} requis**"
+                  f"  \nOriginal : _{it['text'][:140]}_")
+            out += [gr.update(visible=True),
+                    gr.update(value=md),
+                    gr.update(value=it["translation"],
+                              label="Raccourcis cette traduction")]
+        else:
+            out += [gr.update(visible=False), gr.update(), gr.update()]
+    return out
 
 
 def _trad_value_or_saved(src, i, lang_code, proposed):
@@ -454,7 +474,7 @@ def render(video, lang_name, keep, local_path, state, clone, *vals,
                 speakers[min(i, MAX_SPEAKERS - 1)],
                 dubbing.DEFAULT_VOICES.get(lang, "en-US-AriaNeural"))
 
-    yield None, "⏳ Génération en cours…", gr.update(visible=False)
+    yield [None, "⏳ Génération en cours…"] + _warn_empty()
     out_dir = dubbing.default_output_dir(src)
 
     def work(report):
@@ -468,20 +488,20 @@ def render(video, lang_name, keep, local_path, state, clone, *vals,
     try:
         for kind, payload, frac in _run_with_status(work, progress):
             if kind == "status":
-                yield None, (f"⏳ {_prog_bar(frac)} "
-                             f"{int(frac * 100):3d} % — {payload}"), \
-                    gr.update(visible=False)
+                yield ([None, f"⏳ {_prog_bar(frac)} "
+                            f"{int(frac * 100):3d} % — {payload}"]
+                       + _warn_empty())
             else:
                 out_path, warns = payload
                 msg = f"✅ Vidéo sauvée dans : {out_path}"
                 if warns:
                     msg += (f"\n\n⚠️ {len(warns)} passage(s) parlé(s) "
-                            "trop vite — voir le panneau d'alerte "
-                            "au-dessus des zones de traduction.")
-                yield out_path, msg, _warn_html(warns)
+                            "trop vite — corrige-les dans le panneau "
+                            "d'alerte à droite puis régénère.")
+                yield [out_path, msg] + _warn_outputs(state, lang, warns)
     except Exception as e:
-        yield None, f"❌ Erreur pendant la génération : {e}", \
-            gr.update(visible=False)
+        yield ([None, f"❌ Erreur pendant la génération : {e}"]
+               + _warn_empty())
 
 
 with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
@@ -572,6 +592,17 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                             for i in range(MAX_SPEAKERS)]
         with gr.Column():
             warn_box = gr.HTML(visible=False)
+            warn_map = gr.State([])
+            warn_rows = []
+            for _ in range(MAX_WARNS):
+                with gr.Column(visible=False) as wc:
+                    wmd = gr.Markdown()
+                    wtxt = gr.Textbox(interactive=True, lines=2,
+                                      max_lines=8,
+                                      label="Traduction à raccourcir")
+                warn_rows.append((wc, wmd, wtxt))
+            warn_components = ([warn_box, warn_map]
+                               + [c for r in warn_rows for c in r])
             btn_go = gr.Button("Générer la vidéo doublée",
                                variant="primary")
             out_video = gr.Video(label="Vidéo doublée")
@@ -614,7 +645,8 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
     def retranslate(state, lang_name):
         """Re-traduit les zones éditables si la langue a changé après
         l'analyse (les corrections obsolètes sont remplacées)."""
-        noop = [gr.update()] * MAX_SPEAKERS + [gr.update()]
+        noop = ([gr.update()] * MAX_SPEAKERS
+                + [gr.update()] * len(warn_components))
         if not state or not lang_name:
             return noop
         code = LANGS[lang_name]
@@ -639,7 +671,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                 outs.append(gr.update(value=val))
             else:
                 outs.append(gr.update())
-        return outs + [_warn_update(state, code)]
+        return outs + _warn_outputs(state, code)
 
     state = gr.State(None)
 
@@ -651,7 +683,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                 + [gr.update(visible=False)] * MAX_SPEAKERS  # audios
                 + [gr.update(value=MSG_WAIT, visible=True,
                             elem_classes="")]           # statut
-                + [gr.update(visible=False)])           # alerte
+                + _warn_empty())                        # alerte
 
     demo.load(health_report, None, health)
 
@@ -659,7 +691,8 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                        + [c for quad in zip(speaker_rows, voice_dds,
                                             orig_txts, trad_txts)
                           for c in quad]
-                       + [acc_listen] + previews + [status_msg, warn_box])
+                       + [acc_listen] + previews + [status_msg]
+                       + warn_components)
     gate_inputs = [in_video, lang, local_path] + voice_dds
     gate_outputs = [status_msg, btn_an] + voice_dds
 
@@ -669,7 +702,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
         gate, gate_inputs, gate_outputs)
     local_path.change(gate, gate_inputs, gate_outputs)
     lang.change(gate, gate_inputs, gate_outputs).then(
-        retranslate, [state, lang], trad_txts + [warn_box])
+        retranslate, [state, lang], trad_txts + warn_components)
     btn_an.click(analyze, [in_video, lang, multi, num_spk, local_path],
                  analyze_outputs)
     btn_listen.click(listen, [state, lang] + voice_dds + trad_txts,
@@ -683,20 +716,53 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
     def check_trads(state, lang_name, *trad_vals):
         """Recalcule l'alerte « traduction trop longue » après édition."""
         if not state or not lang_name:
-            return gr.update(visible=False)
+            return _warn_empty()
         edited = _collect_edits(state["speakers"], trad_vals)
         if edited:
             dubbing.apply_edited_translations(
                 state["segments"], edited, LANGS[lang_name])
-        return _warn_update(state, LANGS[lang_name])
+        return _warn_outputs(state, LANGS[lang_name])
 
     for t_trad in trad_txts:
-        t_trad.change(check_trads, [state, lang] + trad_txts, warn_box)
+        t_trad.change(check_trads, [state, lang] + trad_txts,
+                      warn_components)
+
+    def edit_warn(row_i, state, wmap, video, local_path, lang_name,
+                  new_text, *trad_vals):
+        """Correction saisie dans le panneau d'alerte : met à jour le
+        segment concerné, la grande zone du locuteur, le fichier de
+        sauvegarde, puis recalcule les alertes."""
+        trad_outs = [gr.update()] * MAX_SPEAKERS
+        if state and lang_name and row_i < len(wmap):
+            code = LANGS[lang_name]
+            seg = state["segments"][wmap[row_i]]
+            if (new_text or "").strip():
+                seg["translation"] = new_text.strip()
+                seg["trans_lang"] = code
+            sp = seg.get("speaker", 0)
+            if sp in state["speakers"]:
+                pos = state["speakers"].index(sp)
+                if pos < MAX_SPEAKERS:
+                    segs = [s for s in state["segments"]
+                            if s.get("speaker") == sp]
+                    full = "\n\n".join(s.get("translation", "")
+                                       for s in segs)
+                    trad_outs[pos] = gr.update(value=full)
+                    save_trad(pos, video, local_path, lang_name, full)
+        return trad_outs + _warn_outputs(
+            state, LANGS.get(lang_name) if lang_name else None)
+
+    for j, (_wc, _wmd, wtxt) in enumerate(warn_rows):
+        wtxt.change(partial(edit_warn, j),
+                    [state, warn_map, in_video, local_path, lang, wtxt]
+                    + trad_txts,
+                    trad_txts + warn_components)
     clone.change(
         lambda c: [gr.update(interactive=not c)] * MAX_SPEAKERS,
         clone, voice_dds)
     btn_go.click(render, [in_video, lang, keep, local_path, state, clone]
-                 + voice_dds + trad_txts, [out_video, info, warn_box])
+                 + voice_dds + trad_txts,
+                 [out_video, info] + warn_components)
 
     gr.HTML('<div class="vd-footer">— Copyright Emmanuel S. Davidson — '
             'Licensed to Aviation et Pilote 2026 —</div>')
