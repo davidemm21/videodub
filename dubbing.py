@@ -436,13 +436,111 @@ def apply_edited_translations(segments, edited_by_speaker, target_lang):
             continue
         for i, s in enumerate(segs):
             if i < len(lines):
+                learn_replacements(s.get("translation", ""), lines[i],
+                                   target_lang)
                 s["translation"] = lines[i]
         if len(lines) > len(segs):
-            segs[-1]["translation"] = " ".join(lines[len(segs) - 1:])
+            merged = " ".join(lines[len(segs) - 1:])
+            learn_replacements(segs[-1].get("translation", ""), merged,
+                               target_lang)
+            segs[-1]["translation"] = merged
         for s in segs:
             if s.get("translation"):
                 s["trans_lang"] = target_lang
     return segments
+
+
+# ---------- glossaire personnel (corrections mémorisées) ----------
+
+GLOSSARY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "dico_perso.json")
+_WORDS = re.compile(r"\w+", re.UNICODE)
+
+
+def load_glossary():
+    """Glossaire {langue_cible: {terme: remplacement}} persisté en JSON."""
+    import json
+    try:
+        with open(GLOSSARY_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_glossary(g):
+    import json
+    try:
+        with open(GLOSSARY_FILE, "w", encoding="utf-8") as f:
+            json.dump(g, f, ensure_ascii=False, indent=2, sort_keys=True)
+    except OSError:
+        pass
+
+
+def learn_replacements(old, new, target_lang):
+    """Apprend les remplacements de mots d'une correction manuelle :
+    diff token à token entre l'ancienne et la nouvelle traduction ;
+    les paires remplacées (≤ 3 mots) sont enregistrées dans le
+    glossaire. Retourne les paires apprises."""
+    import difflib
+    if not old or not new or old.strip() == new.strip() or not target_lang:
+        return []
+    ot, nt = _WORDS.findall(old), _WORDS.findall(new)
+    sm = difflib.SequenceMatcher(
+        a=[w.lower() for w in ot], b=[w.lower() for w in nt])
+    learned = {}
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag != "replace":
+            continue
+        a, b = ot[i1:i2], nt[j1:j2]
+        if not a or not b:
+            continue
+        if len(a) == len(b):              # mot à mot : paires unitaires
+            for x, y in zip(a, b):
+                if x.lower() != y.lower():
+                    learned[x] = y
+        elif len(a) <= 3 and len(b) <= 3:  # courte expression
+            src, dst = " ".join(a), " ".join(b)
+            if src.lower() != dst.lower():
+                learned[src] = dst
+    if learned:
+        g = load_glossary()
+        g.setdefault(target_lang, {}).update(learned)
+        _save_glossary(g)
+    return list(learned.items())
+
+
+def glossary_suggestions(state, target_lang):
+    """Termes du glossaire présents dans les traductions et pas encore
+    remplacés ni ignorés. Retourne des dicts {index, speaker, src, dst,
+    translation}."""
+    g = load_glossary().get(target_lang) or {}
+    if not g or not state:
+        return []
+    ignored = {tuple(x) for x in state.get("dict_ignored", [])}
+    out = []
+    for i, s in enumerate(state["segments"]):
+        tr = s.get("translation") or ""
+        for src, dst in g.items():
+            if (i, src) in ignored:
+                continue
+            if re.search(rf"(?<!\w){re.escape(src)}(?!\w)", tr, re.I):
+                out.append({"index": i, "speaker": s.get("speaker", 0),
+                            "src": src, "dst": dst, "translation": tr})
+    return out
+
+
+def apply_glossary(seg, src, dst):
+    """Remplace toutes les occurrences du terme dans la traduction du
+    segment (insensible à la casse, majuscule initiale préservée)."""
+    pat = re.compile(rf"(?<!\w){re.escape(src)}(?!\w)", re.I)
+
+    def _rep(m):
+        r = dst
+        if m.group(0)[:1].isupper():
+            r = r[:1].upper() + r[1:]
+        return r
+
+    seg["translation"] = pat.sub(_rep, seg.get("translation") or "")
 
 
 async def _tts_one(text, voice, mp3_path):

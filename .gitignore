@@ -9,3 +9,4 @@ __pycache__/
 dub_secrets.py
 # Local secrets written by `elevenlabs onboard`
 /.env.local
+dico_perso.json

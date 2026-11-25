@@ -97,6 +97,9 @@ body, .gradio-container {
 }
 .vd-warnbox > b { color: #92400e; }
 .vd-warnbox .vd-sub { font-size: .85rem; color: #a16207; margin: 4px 0 8px; }
+.vd-dictbox { border-color: #2563eb !important; background: #eff6ff !important; }
+.vd-dictbox > b { color: #1e40af !important; }
+.vd-dictbox .vd-sub { color: #1d4ed8 !important; }
 .vd-warn-seg {
   margin: 6px 0; padding: 8px 10px;
   background: #fff; border: 1px solid #fde68a; border-radius: 8px;
@@ -246,7 +249,7 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                gr.update(value="")] * MAX_SPEAKERS
               + [gr.update(visible=False)]
               + [gr.update(visible=False)] * MAX_SPEAKERS
-              + [busy] + _warn_empty())
+              + [busy] + _warn_empty() + _dict_empty())
     yield [_file_info(src) + "\n\n⏳ Analyse…", None] + hidden
 
     nspk = int(num_spk or 0)
@@ -343,7 +346,8 @@ def analyze(video, lang_name, multi, num_spk, local_path,
                    + [gr.update(visible=True)]                # accordéon
                    + [gr.update(visible=False)] * MAX_SPEAKERS  # audios
                    + [gr.update(visible=False)]                # statut
-                   + _warn_outputs(state, lang))               # alerte
+                   + _warn_outputs(state, lang)                # alerte
+                   + _dict_outputs(state, lang))               # glossaire
     except Exception as e:
         yield ([f"❌ Erreur pendant l'analyse : {e}", None] + hidden)
         return
@@ -413,6 +417,55 @@ def _warn_outputs(state, lang_code, items=None):
                               label="Raccourcis cette traduction")]
         else:
             out += [gr.update(visible=False), gr.update(), gr.update()]
+    return out
+
+
+MAX_SUGGEST = 8
+
+
+def _dict_empty():
+    """Sorties « glossaire masqué » : en-tête + map + MAX_SUGGEST lignes."""
+    return ([gr.update(visible=False), []]
+            + [gr.update(visible=False), gr.update()] * MAX_SUGGEST)
+
+
+def _dict_head(items):
+    if not items:
+        return gr.update(visible=False)
+    extra = (f" (+{len(items) - MAX_SUGGEST} autre(s) — traite d'abord "
+             "ceux-ci)" if len(items) > MAX_SUGGEST else "")
+    return gr.update(
+        visible=True,
+        value=('<div class="vd-warnbox vd-dictbox">'
+               f'<b>📖 {len(items)} remplacement(s) proposé(s) par ton '
+               f'dictionnaire personnel{extra}</b>'
+               '<div class="vd-sub">Mémorisés depuis tes corrections '
+               'précédentes — confirme chaque remplacement avec '
+               '« Appliquer », ou « Ignorer » pour ce passage.</div>'
+               '</div>'))
+
+
+def _dict_outputs(state, lang_code):
+    """Sorties du panneau glossaire : en-tête + jusqu'à MAX_SUGGEST
+    lignes « terme → remplacement » avec boutons Appliquer/Ignorer."""
+    if not state or not lang_code:
+        return _dict_empty()
+    items = dubbing.glossary_suggestions(state, lang_code)
+    if not items:
+        return _dict_empty()
+    out = [_dict_head(items),
+           [(it["index"], it["src"], it["dst"])
+            for it in items[:MAX_SUGGEST]]]
+    for j in range(MAX_SUGGEST):
+        if j < len(items):
+            it = items[j]
+            md = (f"**Segment {it['index'] + 1}** · locuteur "
+                  f"{it['speaker'] + 1} · "
+                  f"« {it['src']} » → « **{it['dst']}** »"
+                  f"  \n_{it['translation'][:140]}_")
+            out += [gr.update(visible=True), gr.update(value=md)]
+        else:
+            out += [gr.update(visible=False), gr.update()]
     return out
 
 
@@ -612,6 +665,19 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                 warn_rows.append((wc, wmd, wtxt))
             warn_components = ([warn_box, warn_map]
                                + [c for r in warn_rows for c in r])
+            dict_head = gr.HTML(visible=False)
+            dict_map = gr.State([])
+            dict_rows = []
+            for _ in range(MAX_SUGGEST):
+                with gr.Row(visible=False) as drow:
+                    dmd = gr.Markdown()
+                    with gr.Column(scale=0, min_width=140):
+                        dok = gr.Button("✓ Appliquer", size="sm",
+                                        variant="primary")
+                        dno = gr.Button("✗ Ignorer", size="sm")
+                dict_rows.append((drow, dmd, dok, dno))
+            dict_components = ([dict_head, dict_map]
+                               + [c for r in dict_rows for c in r[:2]])
             btn_go = gr.Button("Générer la vidéo doublée",
                                variant="primary")
             out_video = gr.Video(label="Vidéo doublée")
@@ -655,7 +721,8 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
         """Re-traduit les zones éditables si la langue a changé après
         l'analyse (les corrections obsolètes sont remplacées)."""
         noop = ([gr.update()] * MAX_SPEAKERS
-                + [gr.update()] * len(warn_components))
+                + [gr.update()] * len(warn_components)
+                + [gr.update()] * len(dict_components))
         if not state or not lang_name:
             return noop
         code = LANGS[lang_name]
@@ -680,7 +747,8 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                 outs.append(gr.update(value=val))
             else:
                 outs.append(gr.update())
-        return outs + _warn_outputs(state, code)
+        return (outs + _warn_outputs(state, code)
+                + _dict_outputs(state, code))
 
     state = gr.State(None)
 
@@ -692,7 +760,8 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                 + [gr.update(visible=False)] * MAX_SPEAKERS  # audios
                 + [gr.update(value=MSG_WAIT, visible=True,
                             elem_classes="")]           # statut
-                + _warn_empty())                        # alerte
+                + _warn_empty()                          # alerte
+                + _dict_empty())                         # glossaire
 
     demo.load(health_report, None, health)
 
@@ -701,7 +770,7 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                                             orig_txts, trad_txts)
                           for c in quad]
                        + [acc_listen] + previews + [status_msg]
-                       + warn_components)
+                       + warn_components + dict_components)
     gate_inputs = [in_video, lang, local_path] + voice_dds
     gate_outputs = [status_msg, btn_an] + voice_dds
 
@@ -711,7 +780,8 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
         gate, gate_inputs, gate_outputs)
     local_path.change(gate, gate_inputs, gate_outputs)
     lang.change(gate, gate_inputs, gate_outputs).then(
-        retranslate, [state, lang], trad_txts + warn_components)
+        retranslate, [state, lang],
+        trad_txts + warn_components + dict_components)
     btn_an.click(analyze, [in_video, lang, multi, num_spk, local_path],
                  analyze_outputs)
     btn_listen.click(listen, [state, lang] + voice_dds + trad_txts,
@@ -725,16 +795,18 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
     def check_trads(state, lang_name, *trad_vals):
         """Recalcule l'alerte « traduction trop longue » après édition."""
         if not state or not lang_name:
-            return _warn_empty()
+            return _warn_empty() + _dict_empty()
         edited = _collect_edits(state["speakers"], trad_vals)
         if edited:
             dubbing.apply_edited_translations(
                 state["segments"], edited, LANGS[lang_name])
-        return _warn_outputs(state, LANGS[lang_name])
+        code = LANGS[lang_name]
+        return (_warn_outputs(state, code)
+                + _dict_outputs(state, code))
 
     for t_trad in trad_txts:
         t_trad.change(check_trads, [state, lang] + trad_txts,
-                      warn_components)
+                      warn_components + dict_components)
 
     def edit_warn(row_i, state, wmap, video, local_path, lang_name,
                   new_text, *trad_vals):
@@ -746,6 +818,8 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
             code = LANGS[lang_name]
             seg = state["segments"][wmap[row_i]]
             if (new_text or "").strip():
+                dubbing.learn_replacements(
+                    seg.get("translation", ""), new_text.strip(), code)
                 seg["translation"] = new_text.strip()
                 seg["trans_lang"] = code
             sp = seg.get("speaker", 0)
@@ -758,14 +832,55 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                                        for s in segs)
                     trad_outs[pos] = gr.update(value=full)
                     save_trad(pos, video, local_path, lang_name, full)
-        return trad_outs + _warn_outputs(
-            state, LANGS.get(lang_name) if lang_name else None)
+        code = LANGS.get(lang_name) if lang_name else None
+        return (trad_outs + _warn_outputs(state, code)
+                + _dict_outputs(state, code))
 
     for j, (_wc, _wmd, wtxt) in enumerate(warn_rows):
         wtxt.change(partial(edit_warn, j),
                     [state, warn_map, in_video, local_path, lang, wtxt]
                     + trad_txts,
-                    trad_txts + warn_components)
+                    trad_txts + warn_components + dict_components)
+
+    def apply_sugg(row_i, state, dmap, video, local_path, lang_name):
+        """Remplacement confirmé dans le panneau glossaire : met à jour
+        le segment, la zone du locuteur, la sauvegarde, puis recalcule
+        alertes + suggestions."""
+        trad_outs = [gr.update()] * MAX_SPEAKERS
+        if state and lang_name and row_i < len(dmap):
+            seg_i, src_t, dst_t = dmap[row_i]
+            seg = state["segments"][seg_i]
+            dubbing.apply_glossary(seg, src_t, dst_t)
+            seg["trans_lang"] = LANGS[lang_name]
+            sp = seg.get("speaker", 0)
+            if sp in state["speakers"]:
+                pos = state["speakers"].index(sp)
+                if pos < MAX_SPEAKERS:
+                    segs = [s for s in state["segments"]
+                            if s.get("speaker") == sp]
+                    full = "\n\n".join(s.get("translation", "")
+                                       for s in segs)
+                    trad_outs[pos] = gr.update(value=full)
+                    save_trad(pos, video, local_path, lang_name, full)
+        code = LANGS.get(lang_name) if lang_name else None
+        return (trad_outs + _warn_outputs(state, code)
+                + _dict_outputs(state, code))
+
+    def skip_sugg(row_i, state, dmap, lang_name):
+        """Remplacement refusé : mémorisé comme ignoré pour cette
+        analyse, la ligne disparaît du panneau."""
+        if state and row_i < len(dmap):
+            seg_i, src_t, _ = dmap[row_i]
+            state.setdefault("dict_ignored", []).append([seg_i, src_t])
+        code = LANGS.get(lang_name) if lang_name else None
+        return _dict_outputs(state, code)
+
+    for j, (_drow, _dmd, dok, dno) in enumerate(dict_rows):
+        dok.click(partial(apply_sugg, j),
+                  [state, dict_map, in_video, local_path, lang],
+                  trad_txts + warn_components + dict_components)
+        dno.click(partial(skip_sugg, j), [state, dict_map, lang],
+                  dict_components)
     def _voice_inter(c, e):
         return [gr.update(interactive=not (c or e))] * MAX_SPEAKERS
 
