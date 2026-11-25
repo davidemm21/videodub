@@ -119,6 +119,9 @@ def check_environment():
     checks.append(("Clonage vocal Chatterbox (optionnel)", True,
                    "installé" if chatterbox_available()
                    else "non installé — option de clonage inactive"))
+    checks.append(("Clonage vocal ElevenLabs (optionnel)", True,
+                   "clé API OK" if elevenlabs_available()
+                   else "pas de clé .env.local — option inactive"))
 
     return checks
 
@@ -542,6 +545,101 @@ def chatterbox_available():
         return False
 
 
+_ELEVENLABS = None
+
+
+def _get_elevenlabs():
+    """Client ElevenLabs, créé une fois. La clé est lue dans
+    .env.local (gitignoré) via ELEVENLABS_API_KEY."""
+    global _ELEVENLABS
+    if _ELEVENLABS is None:
+        from dotenv import load_dotenv
+        from elevenlabs import ElevenLabs
+        load_dotenv(os.path.join(os.path.dirname(__file__), ".env.local"))
+        _ELEVENLABS = ElevenLabs()
+    return _ELEVENLABS
+
+
+def elevenlabs_available():
+    try:
+        import elevenlabs  # noqa: F401
+    except ImportError:
+        return False
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env.local"))
+    return bool(os.environ.get("ELEVENLABS_API_KEY"))
+
+
+def elevenlabs_clone_voice(state, speaker):
+    """Instant Voice Clone du locuteur depuis son extrait original.
+    Retourne un voice_id temporaire (à supprimer après le rendu)."""
+    excerpt = original_excerpt(state, speaker)
+    base = os.path.splitext(os.path.basename(
+        state.get("src_path") or "video"))[0]
+    client = _get_elevenlabs()
+    with open(excerpt, "rb") as f:
+        v = client.voices.ivc.create(
+            name=f"VideoDubber {base[:20]} L{speaker + 1}",
+            files=[f], remove_background_noise=True)
+    return v.voice_id
+
+
+def synthesize_elevenlabs(text, voice_id, lang, mp3_out, retries=3):
+    """TTS ElevenLabs avec la voix clonée — eleven_v4, repli
+    eleven_multilingual_v2, retries avec backoff."""
+    import time as _t
+    from elevenlabs import VoiceSettings
+    client = _get_elevenlabs()
+    last = None
+    for attempt in range(retries):
+        for model in ("eleven_v4", "eleven_multilingual_v2"):
+            try:
+                audio = client.text_to_speech.convert(
+                    voice_id, text=text, model_id=model,
+                    language_code=lang,
+                    output_format="mp3_44100_128",
+                    voice_settings=VoiceSettings(
+                        stability=0.5, similarity_boost=0.9))
+                with open(mp3_out, "wb") as f:
+                    for chunk in audio:
+                        f.write(chunk)
+                return mp3_out
+            except Exception as e:
+                last = e
+        _t.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"ElevenLabs TTS échoué : {last}")
+
+
+def synthesize_elevenlabs_batch(jobs, lang, progress=None, workers=4):
+    """jobs : [(text, voice_id, mp3_out)] — TTS en parallèle
+    (Starter ~4 requêtes simultanées)."""
+    from concurrent.futures import ThreadPoolExecutor
+    done = [0]
+
+    def _s(job):
+        text, voice_id, out = job
+        synthesize_elevenlabs(text, voice_id, lang, out)
+        done[0] += 1
+        if progress:
+            progress(done[0])
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(_s, jobs))
+
+
+def delete_elevenlabs_voices(voice_ids):
+    """Nettoie les clones temporaires du compte (best-effort)."""
+    try:
+        client = _get_elevenlabs()
+    except Exception:
+        return
+    for vid in voice_ids:
+        try:
+            client.voices.delete(vid)
+        except Exception:
+            pass
+
+
 def synthesize_clone(text, ref_wav, lang_id, wav_out):
     """Synthèse par clonage : la voix de `ref_wav` prononce `text`.
     Écrit un wav au taux natif du modèle (le calage/resample est fait
@@ -942,11 +1040,12 @@ def translation_warnings(segments, total_seconds, lang=None,
 def render_video(video_path, state, target_lang, speaker_voices,
                  original_volume=0.1, output_dir=None,
                  edited_translations=None, clone_voices=False,
-                 progress=None):
+                 elabs=False, progress=None):
     """Phase 2 : traduction (corrigée par l'utilisateur si fournie)
     + synthèse par locuteur + mixage.
     clone_voices=True : Chatterbox clone la voix de chaque locuteur depuis
-    l'audio original au lieu des voix neurales (fichier *_CHTBOX_*)."""
+    l'audio original au lieu des voix neurales (fichier *_CHTBOX_*).
+    elabs=True : clonage cloud ElevenLabs (fichier *_EL_*)."""
     def p(msg, frac):
         if progress:
             progress(msg, frac)
@@ -971,37 +1070,56 @@ def render_video(video_path, state, target_lang, speaker_voices,
         for sp in state["speakers"]:
             clone_refs[sp] = original_excerpt(state, sp)
 
-    tts_wavs = [None] * len(segments)
-    raw_map = {}                       # index segment -> audio TTS brut
-    if clone_voices:
-        # Clonage : séquentiel (le modèle MPS ne parallélise pas)
-        for i, seg in enumerate(segments):
-            text = (seg.get("translation") or "").strip()
-            if not text:
-                continue
-            sp = seg.get("speaker", 0)
-            raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
-            synthesize_clone(text, clone_refs[sp], target_lang, raw)
-            raw_map[i] = raw
-            p(f"Clonage {i + 1}/{len(segments)} (locuteur {sp + 1})",
-              0.4 + 0.3 * (i + 1) / len(segments))
-    else:
-        # Voix neurales : TTS en parallèle
-        jobs = []
-        for i, seg in enumerate(segments):
-            text = (seg.get("translation") or "").strip()
-            if not text:
-                continue
-            sp = seg.get("speaker", 0)
-            voice = speaker_voices.get(sp, default_voice)
-            raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
-            jobs.append((text, voice, raw))
-            raw_map[i] = raw
-        n = max(len(jobs), 1)
-        synthesize_batch(
-            jobs,
-            progress=lambda d: p(f"Synthèse vocale {d}/{len(jobs)}",
-                                 0.4 + 0.3 * d / n))
+    elabs_ids = {}
+    if elabs:
+        p("Clonage ElevenLabs des voix…", 0.36)
+        _get_elevenlabs()
+        for sp in state["speakers"]:
+            elabs_ids[sp] = elevenlabs_clone_voice(state, sp)
+
+    try:
+        tts_wavs = [None] * len(segments)
+        raw_map = {}                   # index segment -> audio TTS brut
+        if clone_voices:
+            # Clonage local : séquentiel (MPS ne parallélise pas)
+            for i, seg in enumerate(segments):
+                text = (seg.get("translation") or "").strip()
+                if not text:
+                    continue
+                sp = seg.get("speaker", 0)
+                raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
+                synthesize_clone(text, clone_refs[sp], target_lang, raw)
+                raw_map[i] = raw
+                p(f"Clonage {i + 1}/{len(segments)} (locuteur {sp + 1})",
+                  0.4 + 0.3 * (i + 1) / len(segments))
+        else:
+            # Voix neurales Edge ou clones ElevenLabs : TTS en parallèle
+            jobs = []
+            for i, seg in enumerate(segments):
+                text = (seg.get("translation") or "").strip()
+                if not text:
+                    continue
+                sp = seg.get("speaker", 0)
+                voice = (elabs_ids[sp] if elabs
+                         else speaker_voices.get(sp, default_voice))
+                raw = os.path.join(tmp, f"tts_{i:04d}.mp3")
+                jobs.append((text, voice, raw))
+                raw_map[i] = raw
+            n = max(len(jobs), 1)
+            if elabs:
+                synthesize_elevenlabs_batch(
+                    jobs, target_lang,
+                    progress=lambda d: p(
+                        f"Synthèse vocale {d}/{len(jobs)}",
+                        0.4 + 0.3 * d / n))
+            else:
+                synthesize_batch(
+                    jobs,
+                    progress=lambda d: p(f"Synthèse vocale {d}/{len(jobs)}",
+                                         0.4 + 0.3 * d / n))
+    finally:
+        if elabs_ids:
+            delete_elevenlabs_voices(list(elabs_ids.values()))
 
     # --- calage : durées mesurées + planification dans les pauses ---
     p("Calage temporel…", 0.72)
@@ -1041,7 +1159,8 @@ def render_video(video_path, state, target_lang, speaker_voices,
              original_volume)
     base = os.path.splitext(os.path.basename(video_path))[0]
     out_dir = output_dir or default_output_dir(video_path)
-    tag = "CHTBOX_" if clone_voices else ""
+    tag = ("CHTBOX_" if clone_voices else
+           "EL_" if elabs else "")
     out_path = os.path.join(out_dir, f"{base}_{tag}{target_lang}.mp4")
     mux(video_path, mix_wav, out_path, original_volume)
 

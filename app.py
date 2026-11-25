@@ -451,8 +451,8 @@ def save_trad(i, video, local_path, lang_name, text):
         pass
 
 
-def render(video, lang_name, keep, local_path, state, clone, *vals,
-           progress=gr.Progress()):
+def render(video, lang_name, keep, local_path, state, clone, elabs,
+           *vals, progress=gr.Progress()):
     if not lang_name:
         raise gr.Error("Choisis d'abord la langue cible.")
     if not state:
@@ -460,6 +460,9 @@ def render(video, lang_name, keep, local_path, state, clone, *vals,
     if clone and not dubbing.chatterbox_available():
         raise gr.Error("Chatterbox n'est pas installé "
                        "(pip install chatterbox-tts).")
+    if elabs and not dubbing.elevenlabs_available():
+        raise gr.Error("ElevenLabs : SDK ou clé API manquant "
+                       "(pip install elevenlabs + .env.local).")
     src = _resolve_source(video, local_path)
     lang = LANGS[lang_name]
     speakers = state["speakers"]
@@ -481,7 +484,7 @@ def render(video, lang_name, keep, local_path, state, clone, *vals,
         return dubbing.render_video(src, state, lang, speaker_voices,
                                     original_volume=keep, output_dir=out_dir,
                                     edited_translations=edited,
-                                    clone_voices=clone,
+                                    clone_voices=clone, elabs=elabs,
                                     progress=lambda m, f:
                                     report(m, 0.33 + 0.67 * f))
 
@@ -550,6 +553,12 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                      "voix — bien plus fidèle mais plus lent. Les menus "
                      "de voix neurales sont ignorés. "
                      "Fichier : nom_CHTBOX_langue.mp4")
+            elabs = gr.Checkbox(
+                value=False,
+                label="Cloner les voix (ElevenLabs — cloud, rapide)",
+                info="Clonage instantané via l'API ElevenLabs : ~3 s par "
+                     "segment, très fidèle. Consomme des crédits "
+                     "(~1/caractère). Fichier : nom_EL_langue.mp4")
             status_msg = gr.Markdown(MSG_WAIT)
             btn_an = gr.Button("Analyser la vidéo", variant="primary",
                                interactive=False)
@@ -757,10 +766,17 @@ with gr.Blocks(title="Video Dubber", css=CSS, theme=THEME) as demo:
                     [state, warn_map, in_video, local_path, lang, wtxt]
                     + trad_txts,
                     trad_txts + warn_components)
-    clone.change(
-        lambda c: [gr.update(interactive=not c)] * MAX_SPEAKERS,
-        clone, voice_dds)
-    btn_go.click(render, [in_video, lang, keep, local_path, state, clone]
+    def _voice_inter(c, e):
+        return [gr.update(interactive=not (c or e))] * MAX_SPEAKERS
+
+    clone.change(_voice_inter, [clone, elabs], voice_dds)
+    elabs.change(_voice_inter, [clone, elabs], voice_dds)
+    clone.change(lambda c: gr.update(value=False) if c else gr.update(),
+                 clone, elabs)
+    elabs.change(lambda e: gr.update(value=False) if e else gr.update(),
+                 elabs, clone)
+    btn_go.click(render, [in_video, lang, keep, local_path, state, clone,
+                          elabs]
                  + voice_dds + trad_txts,
                  [out_video, info] + warn_components)
 
