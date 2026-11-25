@@ -456,6 +456,29 @@ GLOSSARY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "dico_perso.json")
 _WORDS = re.compile(r"\w+", re.UNICODE)
 
+# Mots-outils jamais appris : un « remplacement » dessus est presque
+# toujours un artefact de diff sur une phrase réécrite, pas une vraie
+# préférence de traduction.
+_FUNC_WORDS = {
+    "the", "a", "an", "and", "or", "to", "of", "in", "is", "it", "its",
+    "you", "we", "that", "for", "on", "be", "are", "was", "were", "will",
+    "very", "too", "have", "has", "had", "with", "from", "as", "at", "by",
+    "this", "these", "those", "but", "not", "so", "if", "then", "than",
+    "also", "about", "can", "could", "would", "should", "do", "does",
+    "did", "there", "here", "they", "them", "he", "she", "his", "her",
+    "their", "our", "your", "my", "me", "him", "us", "up", "out", "just",
+    "now", "when", "what", "which", "who", "how", "all", "any", "some",
+    "no", "yes", "well", "much", "more", "most", "many", "into", "over",
+    "after", "before", "because", "while", "where", "only", "even",
+    "le", "la", "les", "de", "des", "du", "un", "une", "et", "ou", "en",
+    "dans", "sur", "pour", "par", "avec", "sans", "est", "sont", "ce",
+    "ces", "cette", "il", "elle", "ils", "elles", "nous", "vous", "je",
+    "tu", "ne", "pas", "plus", "tout", "tous", "mais", "comme", "qui",
+    "que", "quoi", "dont", "au", "aux", "son", "sa", "ses", "leur",
+    "leurs", "mon", "ma", "mes", "ton", "ta", "tes", "se", "si", "lui",
+    "eux", "aussi", "bien", "peu", "trop", "alors", "donc", "car", "ni",
+}
+
 
 def load_glossary():
     """Glossaire {langue_cible: {terme: remplacement}} persisté en JSON."""
@@ -485,23 +508,35 @@ def learn_replacements(old, new, target_lang):
     if not old or not new or old.strip() == new.strip() or not target_lang:
         return []
     ot, nt = _WORDS.findall(old), _WORDS.findall(new)
+    if not ot or not nt:
+        return []
     sm = difflib.SequenceMatcher(
         a=[w.lower() for w in ot], b=[w.lower() for w in nt])
+    ops = sm.get_opcodes()
+    changed = sum((i2 - i1) + (j2 - j1)
+                  for tag, i1, i2, j1, j2 in ops if tag != "equal")
+    # phrase entièrement réécrite -> pas un « remplacement de mot »,
+    # le diff fragmente en paires parasites : on n'apprend rien.
+    if changed > max(6, 0.5 * (len(ot) + len(nt))):
+        return []
     learned = {}
-    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+    for tag, i1, i2, j1, j2 in ops:
         if tag != "replace":
             continue
         a, b = ot[i1:i2], nt[j1:j2]
         if not a or not b:
             continue
         if len(a) == len(b):              # mot à mot : paires unitaires
-            for x, y in zip(a, b):
-                if x.lower() != y.lower():
-                    learned[x] = y
+            cands = list(zip(a, b))
         elif len(a) <= 3 and len(b) <= 3:  # courte expression
-            src, dst = " ".join(a), " ".join(b)
-            if src.lower() != dst.lower():
-                learned[src] = dst
+            cands = [(" ".join(a), " ".join(b))]
+        else:
+            continue
+        for src, dst in cands:
+            if (src.lower() == dst.lower() or len(src) < 3
+                    or src.lower() in _FUNC_WORDS):
+                continue
+            learned[src] = dst
     if learned:
         g = load_glossary()
         g.setdefault(target_lang, {}).update(learned)
