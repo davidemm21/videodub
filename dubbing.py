@@ -748,12 +748,15 @@ def is_temp_path(path):
 
 
 def default_output_dir(video_path):
-    """Dossier de sortie : à côté de la source si c'est un vrai chemin
-    utilisateur ; sinon ~/Downloads (upload navigateur = temp Gradio)."""
-    d = os.path.dirname(os.path.abspath(video_path))
-    if not is_temp_path(video_path) and os.access(d, os.W_OK):
-        return d
-    return os.path.expanduser("~/Downloads")
+    """Dossier de travail : ~/Downloads/<nom de la vidéo>/ — regroupe
+    l'analyse, les traductions sauvegardées et la vidéo doublée."""
+    base = os.path.splitext(os.path.basename(video_path))[0] or "video"
+    d = os.path.join(os.path.expanduser("~/Downloads"), base)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return os.path.expanduser("~/Downloads")
+    return d
 
 
 def translation_file(video_path, speaker_index, target_lang):
@@ -812,12 +815,16 @@ def load_analysis(video_path, diarize_speakers, num_speakers):
         data = json.load(open(path, encoding="utf-8"))
     except Exception:
         return None
+    wav = data.get("src_wav") or ""
+    if not os.path.exists(wav):
+        wav = _analysis_wav(video_path)
     if (data.get("diarize") != diarize_speakers
             or data.get("num_speakers") != num_speakers
             or data.get("src_mtime") != os.path.getmtime(video_path)
             or not data.get("segments")
-            or not os.path.exists(data.get("src_wav") or "")):
+            or not os.path.exists(wav)):
         return None
+    data["src_wav"] = wav
     data["genders"] = {int(k): v for k, v in
                        data.get("genders", {}).items()}
     data["tmp"] = tempfile.mkdtemp(prefix="dub_")

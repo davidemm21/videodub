@@ -314,15 +314,8 @@ def analyze(video, lang_name, multi, num_spk, local_path,
             lines.append("✏️ **Corrige les traductions** dans les zones de "
                          "droite — sauvegarde automatique à chaque frappe "
                          "puis clique « Générer la vidéo doublée ».")
-            lines.append(f"📁 Traductions sauvegardées dans : "
-                         f"`{save_dir}` "
-                         f"(`{os.path.basename(src)[:-4] or 'video'}"
-                         f"_traduction_NN_{lang}.txt`)")
-            if dubbing.is_temp_path(src):
-                lines.append("ℹ️ Vidéo chargée par upload : le dossier "
-                             "d'origine n'est pas accessible — pour "
-                             "sauvegarder à côté de la vidéo, utilise le "
-                             "champ « chemin local du fichier ».")
+            lines.append(f"📁 Tous les fichiers dans : `{save_dir}` "
+                         "(analyse, traductions, vidéo doublée)")
             if restored:
                 lines.append(f"💾 {restored} traduction(s) restaurée(s) "
                              f"depuis les fichiers de sauvegarde.")
